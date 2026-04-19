@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Fixture output is regenerable from fixtures.py; session state is per-user.
+data/
