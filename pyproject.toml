@@ -1,0 +1,37 @@
+[project]
+name = "textbook-companion"
+version = "0.1.0"
+description = "Personal CLI reading companion for coding textbooks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+textbook-companion = "textbook_companion.session:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: hits the real Anthropic API (skipped by default)",
+]
+addopts = "-m 'not live'"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+
+[[tool.mypy.overrides]]
+module = ["textbook_companion.models", "textbook_companion.storage"]
+strict = true
