@@ -371,6 +371,76 @@ def test_status_shows_everything(data_root: Path) -> None:
     assert "recursion" in joined
 
 
+# --- ask -----------------------------------------------------------------
+
+
+def test_ask_calls_llm_and_logs_question_and_answer(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    storage.save_session_state(data_root, state)
+
+    llm = FakeLLM(chat_returns=["Because a bare `return` is the same as `return None`."])
+    session, lines = _make_session(data_root, llm)
+    session.cmd_ask("why does a function return None by default?")
+
+    # Answer was printed.
+    assert any("bare `return`" in l for l in lines)
+
+    # Exactly one chat call; system prompt contained the active chapter JSON.
+    assert [c.method for c in llm.calls] == ["chat"]
+    assert '"chapter_num": 5' in llm.calls[0].system
+
+    # Log has a single 'question' entry with the answer in metadata.
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.entry_type == "question"
+    assert entry.chapter_num == 5
+    assert entry.content == "why does a function return None by default?"
+    assert entry.metadata["answer"].startswith("Because a bare")
+
+
+def test_ask_requires_active_chapter(data_root: Path) -> None:
+    llm = FakeLLM()
+    session, lines = _make_session(data_root, llm)
+    session.cmd_ask("anything")
+    assert any("No active chapter" in l for l in lines)
+    assert llm.calls == []
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert entries == []
+
+
+# --- note ----------------------------------------------------------------
+
+
+def test_note_logs_entry_and_does_not_call_llm(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 7
+    storage.save_session_state(data_root, state)
+
+    llm = FakeLLM()
+    session, lines = _make_session(data_root, llm)
+    session.cmd_note("slicing syntax still trips me up")
+
+    assert any("Note logged for ch7" in l for l in lines)
+    assert llm.calls == []
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.entry_type == "note"
+    assert entry.chapter_num == 7
+    assert entry.content == "slicing syntax still trips me up"
+    assert entry.metadata == {}
+
+
+def test_note_requires_active_chapter(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_note("untethered thought")
+    assert any("No active chapter" in l for l in lines)
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert entries == []
+
+
 # --- API error handling --------------------------------------------------
 
 

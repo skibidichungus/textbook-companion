@@ -10,7 +10,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-EntryType = Literal["reaction", "quiz_answer", "struggle_flag", "problem_attempt"]
+EntryType = Literal[
+    "reaction",
+    "quiz_answer",
+    "struggle_flag",
+    "problem_attempt",
+    "question",
+    "note",
+]
 
 
 class Concept(BaseModel):

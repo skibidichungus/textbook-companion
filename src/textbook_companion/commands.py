@@ -42,6 +42,16 @@ class StrugglingWith:
 
 
 @dataclass(frozen=True)
+class Ask:
+    question: str
+
+
+@dataclass(frozen=True)
+class Note:
+    text: str
+
+
+@dataclass(frozen=True)
 class Status:
     pass
 
@@ -63,6 +73,8 @@ Command = Union[
     RecapChapter,
     LookupConcept,
     StrugglingWith,
+    Ask,
+    Note,
     Status,
     Quit,
     Unknown,
@@ -111,5 +123,13 @@ def parse(line: str) -> Command:
     if lower.startswith("concept "):
         term = text[len("concept "):].strip()
         return LookupConcept(term) if term else Unknown(text)
+
+    if lower.startswith("ask "):
+        question = text[len("ask "):].strip()
+        return Ask(question) if question else Unknown(text)
+
+    if lower.startswith("note "):
+        note = text[len("note "):].strip()
+        return Note(note) if note else Unknown(text)
 
     return Unknown(text)

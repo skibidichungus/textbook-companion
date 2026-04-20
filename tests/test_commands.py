@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from textbook_companion.commands import (
+    Ask,
     DoneChapter,
     LookupConcept,
+    Note,
     Quit,
     RecapChapter,
     StartChapter,
@@ -76,3 +78,29 @@ def test_unknown_command() -> None:
     cmd = parse("make me a sandwich")
     assert isinstance(cmd, Unknown)
     assert cmd.raw == "make me a sandwich"
+
+
+def test_ask_command() -> None:
+    assert parse("ask why does a function return None by default") == Ask(
+        "why does a function return None by default"
+    )
+    # leading/trailing whitespace in the question is stripped
+    assert parse("ask   how is scope defined   ") == Ask("how is scope defined")
+
+
+def test_ask_requires_a_question() -> None:
+    assert isinstance(parse("ask"), Unknown)
+    assert isinstance(parse("ask   "), Unknown)
+
+
+def test_note_command() -> None:
+    assert parse("note re-read Program 5-3") == Note("re-read Program 5-3")
+    # Case of the verb matters only for the prefix, not the note body.
+    assert parse("NOTE watch out for mutable defaults") == Note(
+        "watch out for mutable defaults"
+    )
+
+
+def test_note_requires_text() -> None:
+    assert isinstance(parse("note"), Unknown)
+    assert isinstance(parse("note   "), Unknown)

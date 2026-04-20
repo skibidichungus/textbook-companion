@@ -1,6 +1,6 @@
 # Textbook Companion — Phase 1 Handoff
 
-You're building Phase 1 of a personal CLI tool: a reading companion for coding textbooks. I read chapters in a PDF viewer or on paper; the app helps me recall, connect, and retain what I read across chapters. It is *not* a Q&A search tool — it's a companion that remembers what I've read and surfaces it back at the right time.
+You're building Phase 1 of a personal CLI tool: a reading companion for coding textbooks. I read chapters in a PDF viewer or on paper; the app helps me recall, connect, and retain what I read across chapters. It's a companion that remembers what I've read and surfaces it back at the right time — and it also lets me type in ad-hoc questions or notes that come up while reading. Questions are answered in the context of the active chapter (not generic programming help); notes get logged so I can revisit them later.
 
 Phase 1 uses fake fixture data only. No PDF ingestion.
 
@@ -95,7 +95,7 @@ class LogEntry(BaseModel):
     timestamp: str
     book_id: str
     chapter_num: int
-    entry_type: Literal["reaction", "quiz_answer", "struggle_flag", "problem_attempt"]
+    entry_type: Literal["reaction", "quiz_answer", "struggle_flag", "problem_attempt", "question", "note"]
     content: str
     metadata: dict
 ```
@@ -195,6 +195,17 @@ Implementation notes:
 - Errors from the API: print `API error: <msg>` and return to the prompt. Don't crash the loop. Don't retry beyond what the SDK does by default.
 
 Tests: command parsing (no LLM needed), state transitions, log append behavior. Mock `LLMClient` for everything except the M3 smoke test.
+
+Stop and report.
+
+### M4.5 — Ad-hoc questions and notes
+
+Added after the original M4 ship so the companion is more than a command dispatcher. Two new commands:
+
+- `ask <question>` — sends the question to Claude with the base system prompt (session_system + book overview + active chapter JSON, cached). Prints the answer and logs a `question` entry whose `content` is the question and whose `metadata.answer` is the model's reply. Requires an active chapter so answers stay grounded.
+- `note <text>` — logs a `note` entry attached to the active chapter. No LLM call. Requires an active chapter.
+
+Extend `EntryType` with `"question"` and `"note"`. Tests: parser round-trip for both; session tests that verify the log entries are written with the right fields and that both commands refuse cleanly without an active chapter.
 
 Stop and report.
 

@@ -100,6 +100,10 @@ class Session:
                 self.cmd_concept(term)
             case commands.StrugglingWith(term):
                 self.cmd_struggling(term)
+            case commands.Ask(question):
+                self.cmd_ask(question)
+            case commands.Note(text):
+                self.cmd_note(text)
             case commands.Status():
                 self.cmd_status()
             case commands.Unknown(raw):
@@ -242,6 +246,42 @@ class Session:
         self._log(chapter_num, "struggle_flag", term, metadata={})
         self._save_state()
         self.out(f"Flagged '{term}' as a struggle in ch{chapter_num}.")
+
+    def cmd_ask(self, question: str) -> None:
+        chapter_num = self.state.current_chapter
+        if chapter_num is None:
+            self.out(
+                "No active chapter. Start one with `starting ch<N>` first — "
+                "questions are answered in the context of a chapter."
+            )
+            return
+        ch = self._load_chapter(chapter_num)
+        if ch is None:
+            return
+        answer = self.llm.chat(
+            system=self._base_system(ch),
+            messages=[{"role": "user", "content": question}],
+            cache_system=True,
+        )
+        self.out(answer)
+        self._log(
+            chapter_num,
+            "question",
+            question,
+            metadata={"answer": answer},
+        )
+        self._save_state()
+
+    def cmd_note(self, text: str) -> None:
+        chapter_num = self.state.current_chapter
+        if chapter_num is None:
+            self.out(
+                "No active chapter. Start one with `starting ch<N>` first."
+            )
+            return
+        self._log(chapter_num, "note", text, metadata={})
+        self._save_state()
+        self.out(f"Note logged for ch{chapter_num}.")
 
     def cmd_status(self) -> None:
         if self.state.current_chapter is not None:
