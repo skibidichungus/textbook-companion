@@ -1,0 +1,411 @@
+"""Session loop integration tests.
+
+The LLM is replaced by a FakeLLM that records every call and returns canned
+responses. User input is fed through a scripted `ask` callable; output is
+captured into a list. No real Anthropic calls are made.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+import pytest
+from pydantic import BaseModel
+
+from textbook_companion import fixtures, storage
+from textbook_companion.fixtures import BOOK_ID
+from textbook_companion.llm import StructuredOutputError
+from textbook_companion.session import Session
+
+
+# --- Fakes ---------------------------------------------------------------
+
+
+@dataclass
+class FakeLLMCall:
+    method: str
+    system: str
+    payload: Any
+
+
+class FakeLLM:
+    def __init__(
+        self,
+        chat_returns: list[Any] | None = None,
+        structured_returns: list[Any] | None = None,
+    ) -> None:
+        # Each entry can be either a string/value to return or an Exception to raise.
+        self._chat = iter(chat_returns if chat_returns is not None else ["(fake recap)"])
+        self._structured = iter(
+            structured_returns
+            if structured_returns is not None
+            else [_QuizReturn(["q1?", "q2?"])]
+        )
+        self.calls: list[FakeLLMCall] = []
+
+    def chat(
+        self, system: str, messages: list[dict[str, Any]], cache_system: bool = True
+    ) -> str:
+        self.calls.append(FakeLLMCall("chat", system, messages))
+        val = next(self._chat)
+        if isinstance(val, Exception):
+            raise val
+        return val  # type: ignore[no-any-return]
+
+    def structured(self, system: str, user: str, schema: type[BaseModel]) -> BaseModel:
+        self.calls.append(FakeLLMCall("structured", system, user))
+        val = next(self._structured)
+        if isinstance(val, Exception):
+            raise val
+        if isinstance(val, _QuizReturn):
+            return schema.model_validate({"questions": val.questions})
+        return val  # type: ignore[no-any-return]
+
+
+@dataclass
+class _QuizReturn:
+    questions: list[str] = field(default_factory=list)
+
+
+def scripted_ask(inputs: list[str]) -> Callable[[str], str]:
+    it = iter(inputs)
+
+    def _ask(prompt: str) -> str:
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError(f"ran out of scripted input at prompt: {prompt!r}")
+
+    return _ask
+
+
+def collecting_out() -> tuple[Callable[[str], None], list[str]]:
+    lines: list[str] = []
+
+    def _out(s: str) -> None:
+        lines.append(s)
+
+    return _out, lines
+
+
+# --- Fixtures ------------------------------------------------------------
+
+
+@pytest.fixture
+def data_root(tmp_path: Path) -> Path:
+    fixtures.write_fixtures(tmp_path)
+    return tmp_path
+
+
+def _make_session(
+    data_root: Path,
+    llm: FakeLLM,
+    inputs: list[str] | None = None,
+) -> tuple[Session, list[str]]:
+    out, lines = collecting_out()
+    ask = scripted_ask(inputs or [])
+    session = Session(data_root, BOOK_ID, llm=llm, out=out, ask=ask)
+    return session, lines
+
+
+# --- Greeting ------------------------------------------------------------
+
+
+def test_greeting_with_no_progress(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session._greet()
+    joined = "\n".join(lines)
+    assert "Textbook Companion" in joined
+    assert "Starting Out with Python" in joined
+    assert "No progress yet" in joined
+
+
+def test_greeting_with_active_chapter(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session._greet()
+    assert any("left off in ch5" in l for l in lines)
+
+
+# --- starting chN --------------------------------------------------------
+
+
+def test_starting_updates_state(data_root: Path) -> None:
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 5
+
+
+def test_starting_shows_deps_and_no_stale_refresher_when_fresh(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    # ch4 completed right now — not stale.
+    state.chapters_completed[4] = datetime.now(timezone.utc).isoformat()
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_starting(5)
+    joined = "\n".join(lines)
+    assert "Depends on:" in joined
+    assert "Refresher" not in joined
+
+
+def test_starting_triggers_stale_prereq_refresher(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    # ch4 completed 10 days ago — stale.
+    state.chapters_completed[4] = (
+        datetime.now(timezone.utc) - timedelta(days=10)
+    ).isoformat()
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(
+        data_root, FakeLLM(), inputs=["" ]  # pressing enter to continue
+    )
+    session.cmd_starting(5)
+    joined = "\n".join(lines)
+    assert "Refresher on prereqs" in joined
+    assert "ch4:" in joined  # stale prereq listed
+    # No LLM call made on starting (it's pure state update + file reads).
+    assert session.llm.calls == []
+
+
+def test_starting_unknown_chapter(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_starting(99)
+    assert any("No such chapter" in l for l in lines)
+    # State unchanged.
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter is None
+
+
+# --- done chN ------------------------------------------------------------
+
+
+def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=["Recap of ch5: functions etc."],
+        structured_returns=[_QuizReturn(["Why use functions?", "What is scope?"])],
+    )
+    # Scripted: 2 quiz answers, then reaction, then problems attempted
+    inputs = [
+        "because DRY",      # A1
+        "local variables",  # A2
+        "liked this one",   # reaction
+        "1, 3",             # problems attempted (indices)
+    ]
+    session, lines = _make_session(data_root, llm, inputs=inputs)
+    session.cmd_done(5)
+
+    # Chapter marked complete.
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert 5 in reloaded.chapters_completed
+
+    # Log has quiz_answer x2, reaction x1, problem_attempt x2.
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    types = [e.entry_type for e in entries]
+    assert types == [
+        "quiz_answer",
+        "quiz_answer",
+        "reaction",
+        "problem_attempt",
+        "problem_attempt",
+    ]
+    # Quiz answers carry the question text in metadata.
+    quiz_entries = [e for e in entries if e.entry_type == "quiz_answer"]
+    assert quiz_entries[0].metadata["question"] == "Why use functions?"
+    assert quiz_entries[0].metadata["q_num"] == 1
+
+    # LLM was called: 1 chat (recap) + 1 structured (quiz).
+    assert [c.method for c in llm.calls] == ["chat", "structured"]
+    # System prompts contained the chapter JSON (active chapter block).
+    assert '"chapter_num": 5' in llm.calls[0].system
+    assert '"chapter_num": 5' in llm.calls[1].system
+    # Recap call includes the recap instructions; quiz call includes quiz instructions.
+    assert "Recap instructions" in llm.calls[0].system
+    assert "Quiz instructions" in llm.calls[1].system
+
+
+def test_done_flow_skips_problems_section_when_chapter_has_none(data_root: Path) -> None:
+    # ch6 is a sparse chapter with no end_of_chapter_problems.
+    llm = FakeLLM(
+        chat_returns=["Recap of ch6."],
+        structured_returns=[_QuizReturn(["q?"])],
+    )
+    inputs = [
+        "my answer",  # A1
+        "",           # no reaction
+        # no "problems" prompt should appear, so no more inputs expected
+    ]
+    session, lines = _make_session(data_root, llm, inputs=inputs)
+    session.cmd_done(6)
+    joined = "\n".join(lines)
+    assert "Which end-of-chapter problems" not in joined
+
+
+def test_done_flow_skips_quiz_section_when_no_questions(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=["Recap of ch5."],
+        structured_returns=[_QuizReturn([])],  # empty quiz
+    )
+    inputs = [
+        "",         # reaction skipped
+        "",         # problems blank
+    ]
+    session, _ = _make_session(data_root, llm, inputs=inputs)
+    session.cmd_done(5)
+    # No quiz_answer entries logged.
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert [e.entry_type for e in entries] == []
+
+
+# --- what was / recap ----------------------------------------------------
+
+
+def test_what_was_prints_one_line_and_overview(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_what_was(5)
+    joined = "\n".join(lines)
+    assert "Functions" in joined  # chapter title
+    assert "Defining and calling functions" in joined  # one_line
+
+
+def test_recap_prints_overview_concepts_and_examples_no_llm(data_root: Path) -> None:
+    llm = FakeLLM()
+    session, lines = _make_session(data_root, llm)
+    session.cmd_recap(5)
+    joined = "\n".join(lines)
+    assert "Functions" in joined
+    assert "Key concepts:" in joined
+    assert "Worked examples:" in joined
+    assert "Program 5-" in joined
+    # No LLM call.
+    assert llm.calls == []
+
+
+# --- concept -------------------------------------------------------------
+
+
+def test_concept_found(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_concept("function")
+    joined = "\n".join(lines)
+    assert "function:" in joined
+    assert "first introduced in ch5" in joined
+    assert "also used in:" in joined
+
+
+def test_concept_case_insensitive(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_concept("FUNCTION")
+    assert any("first introduced in ch5" in l for l in lines)
+
+
+def test_concept_not_found(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_concept("monads")
+    assert any("No concept 'monads' found" in l for l in lines)
+
+
+# --- struggling ----------------------------------------------------------
+
+
+def test_struggling_updates_state_and_log(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 12
+    storage.save_session_state(data_root, state)
+
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_struggling("recursion")
+
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.struggle_flags == {"recursion": [12]}
+
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    assert entries[0].entry_type == "struggle_flag"
+    assert entries[0].content == "recursion"
+    assert entries[0].chapter_num == 12
+
+
+def test_struggling_requires_active_chapter(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_struggling("anything")
+    assert any("No active chapter" in l for l in lines)
+    # State unchanged.
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.struggle_flags == {}
+
+
+def test_struggling_with_same_term_twice_dedupes_chapter_list(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 12
+    storage.save_session_state(data_root, state)
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_struggling("recursion")
+    session.cmd_struggling("recursion")
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.struggle_flags == {"recursion": [12]}
+
+
+# --- status --------------------------------------------------------------
+
+
+def test_status_shows_everything(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 7
+    state.chapters_completed = {1: "2026-04-10T00:00:00+00:00"}
+    state.struggle_flags = {"recursion": [12]}
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_status()
+    joined = "\n".join(lines)
+    assert "Current chapter: ch7" in joined
+    assert "ch1:" in joined
+    assert "Struggle flags:" in joined
+    assert "recursion" in joined
+
+
+# --- API error handling --------------------------------------------------
+
+
+def test_api_error_during_chat_does_not_crash_loop(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=[StructuredOutputError("boom from the fake API")],
+        structured_returns=[_QuizReturn(["q?"])],
+    )
+    session, lines = _make_session(data_root, llm, inputs=["done ch5", "quit"])
+
+    session.run()
+    joined = "\n".join(lines)
+    assert "API error:" in joined
+    assert "boom from the fake API" in joined
+    # Loop exited cleanly via quit, not a crash.
+    assert "bye." in joined
+
+
+# --- run() loop smoke ----------------------------------------------------
+
+
+def test_run_loop_dispatches_then_quits(data_root: Path) -> None:
+    llm = FakeLLM()
+    session, lines = _make_session(
+        data_root, llm, inputs=["status", "quit"]
+    )
+    session.run()
+    joined = "\n".join(lines)
+    assert "Current chapter" in joined
+    assert "bye." in joined
+
+
+def test_run_loop_handles_unknown_commands(data_root: Path) -> None:
+    session, lines = _make_session(
+        data_root, FakeLLM(), inputs=["what even", "quit"]
+    )
+    session.run()
+    assert any("Unknown command" in l for l in lines)

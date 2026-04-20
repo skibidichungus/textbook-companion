@@ -62,6 +62,11 @@ class StructuredOutputError(RuntimeError):
     """Raised when the model did not emit the forced tool call we asked for."""
 
 
+# Re-exported tuple so other modules can catch LLM-layer failures without
+# importing `anthropic` directly (only llm.py is allowed to do that).
+LLMError: tuple[type[BaseException], ...] = (anthropic.APIError, StructuredOutputError)
+
+
 class ClaudeClient:
     """Concrete `LLMClient` backed by the Anthropic SDK."""
 

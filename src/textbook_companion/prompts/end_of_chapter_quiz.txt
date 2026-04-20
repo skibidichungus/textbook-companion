@@ -1,0 +1,14 @@
+# Quiz instructions
+
+Generate 2 or 3 end-of-chapter quiz questions for the Active Chapter.
+Constraints:
+
+- Test understanding, not recall. Prefer "why does X happen" or "what would
+  you change to do Y" over "what is the definition of Z".
+- Each question must be answerable from material in the Active Chapter (and
+  earlier chapters the student has already read). Do not ask about topics
+  introduced later in the book.
+- Phrase as plain questions, one per item. Do not include answers, numbering,
+  or explanations.
+
+Emit the result through the provided tool as a list of question strings.

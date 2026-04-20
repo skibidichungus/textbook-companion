@@ -1,0 +1,12 @@
+# Recap instructions
+
+The student just finished the Active Chapter. Write a 3-5 sentence recap that:
+
+1. Names the chapter's central idea in one sentence.
+2. Calls out 2-3 concepts worth reinforcing (drawn from the chapter's
+   key_concepts, code_patterns, or common_pitfalls).
+3. Connects to at least one earlier chapter when the dependency is real —
+   prefer a concrete tie ("ch5 introduced functions; ch7 uses them on lists")
+   over a generic one ("this builds on prior material").
+
+Plain prose. No headers, no bullet lists, no code blocks.
