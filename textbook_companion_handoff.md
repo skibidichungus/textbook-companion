@@ -245,6 +245,21 @@ Tests: model round-trip for the new field; session tests for marking in-progress
 
 Stop and report.
 
+### M4.8 — Quiz answer feedback
+
+The original `done` flow asked quiz questions but gave no response to the answers — the student had no signal whether they got it right. This milestone adds a short tutor-style feedback pass after each answer.
+
+- New prompt file `prompts/quiz_feedback.txt` defining the feedback voice: 2–3 sentences, lead with what the student got right, name what they missed, end with the "here's how I'd put it" version. No scores, no "correct/incorrect" labels.
+- After each quiz answer in `cmd_done`, call `llm.chat()` with `base_system + quiz_feedback_prompt` as the system and `"Question: {q}\nStudent's answer: {answer}"` as the user message.
+- Print the feedback immediately before moving to the next question.
+- Log it in the existing `quiz_answer` entry's `metadata.feedback`, alongside the question text and `q_num`.
+
+Cost impact: one extra chat call per quiz question (so a 3-question quiz goes from 2 LLM calls to 5). Still cents per chapter on Opus 4.7.
+
+Tests: updated `test_done_flow_logs_and_marks_complete` to assert the new call order `["chat", "structured", "chat", "chat"]` and verify the feedback appears both in stdout and in log metadata; dedicated `test_done_flow_feedback_is_printed_and_logged` for a single-question quiz.
+
+Stop and report.
+
 ### M5 — Polish
 
 - `README.md`: install (`uv sync`), env setup, run command, the full command list with one-line descriptions

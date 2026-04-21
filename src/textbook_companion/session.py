@@ -68,6 +68,7 @@ class Session:
         self.session_system_prompt = _read_prompt("session_system.txt")
         self.chapter_recap_prompt = _read_prompt("chapter_recap.txt")
         self.end_of_chapter_quiz_prompt = _read_prompt("end_of_chapter_quiz.txt")
+        self.quiz_feedback_prompt = _read_prompt("quiz_feedback.txt")
 
     # ----- event loop -----
 
@@ -207,15 +208,31 @@ class Session:
             schema=QuizSet,
         )
         if quiz.questions:
+            feedback_sys = base_sys + "\n\n" + self.quiz_feedback_prompt
             self.out(f"\n== Quiz ({len(quiz.questions)} questions) ==")
             for i, q in enumerate(quiz.questions, 1):
                 self.out(f"Q{i}: {q}")
                 answer = self.ask("A: ").strip()
+                feedback = self.llm.chat(
+                    system=feedback_sys,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Question: {q}\nStudent's answer: {answer}",
+                        }
+                    ],
+                    cache_system=True,
+                )
+                self.out(feedback)
                 self._log(
                     n,
                     "quiz_answer",
                     answer,
-                    metadata={"question": q, "q_num": i},
+                    metadata={
+                        "question": q,
+                        "q_num": i,
+                        "feedback": feedback,
+                    },
                 )
 
         # 3. Reflections

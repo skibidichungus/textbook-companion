@@ -323,7 +323,11 @@ def test_greeting_mentions_other_in_progress_chapters(data_root: Path) -> None:
 
 def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
     llm = FakeLLM(
-        chat_returns=["Recap of ch5: functions etc."],
+        chat_returns=[
+            "Recap of ch5: functions etc.",
+            "You've got the DRY instinct; functions also let you update logic in one place.",
+            "Right about locals; remember globals are visible across the whole module.",
+        ],
         structured_returns=[_QuizReturn(["Why use functions?", "What is scope?"])],
     )
     # Scripted: 2 quiz answers, then reflection. No more batch problem-attempts
@@ -347,19 +351,52 @@ def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
     quiz_entries = [e for e in entries if e.entry_type == "quiz_answer"]
     assert quiz_entries[0].metadata["question"] == "Why use functions?"
     assert quiz_entries[0].metadata["q_num"] == 1
+    # Each quiz entry now carries the per-answer feedback text.
+    assert quiz_entries[0].metadata["feedback"].startswith("You've got the DRY")
+    assert quiz_entries[1].metadata["feedback"].startswith("Right about locals")
 
-    # LLM was called: 1 chat (recap) + 1 structured (quiz).
-    assert [c.method for c in llm.calls] == ["chat", "structured"]
+    # LLM calls: recap (chat) + quiz (structured) + 2 feedback (chat per answer).
+    assert [c.method for c in llm.calls] == ["chat", "structured", "chat", "chat"]
     assert '"chapter_num": 5' in llm.calls[0].system
     assert '"chapter_num": 5' in llm.calls[1].system
     assert "Recap instructions" in llm.calls[0].system
     assert "Quiz instructions" in llm.calls[1].system
+    assert "Quiz feedback instructions" in llm.calls[2].system
+    assert "Quiz feedback instructions" in llm.calls[3].system
+    # Feedback user messages carry both the question and the student's answer.
+    assert "Why use functions?" in llm.calls[2].payload[0]["content"]
+    assert "because DRY" in llm.calls[2].payload[0]["content"]
 
     # UX: the reflections prompt uses the new wording.
     joined = "\n".join(lines)
     assert "reflections" in joined.lower()
     # And the old batch problems question is gone.
     assert "Which end-of-chapter problems" not in joined
+    # Feedback text is printed back to the user immediately after their answer.
+    assert any("DRY instinct" in l for l in lines)
+
+
+def test_done_flow_feedback_is_printed_and_logged(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=["(recap)", "feedback text for q1"],
+        structured_returns=[_QuizReturn(["q1?"])],
+    )
+    session, lines = _make_session(
+        data_root, llm, inputs=["my answer", ""]  # answer + blank reflection
+    )
+    session.cmd_done(5)
+
+    # Feedback printed back to the user.
+    assert any("feedback text for q1" in l for l in lines)
+
+    # Feedback persisted in the quiz_answer log entry's metadata.
+    entries = [
+        e
+        for e in storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+        if e.entry_type == "quiz_answer"
+    ]
+    assert len(entries) == 1
+    assert entries[0].metadata["feedback"] == "feedback text for q1"
 
 
 def test_done_flow_skips_quiz_section_when_no_questions(data_root: Path) -> None:
