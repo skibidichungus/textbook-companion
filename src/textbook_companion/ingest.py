@@ -35,9 +35,10 @@ from .models import BookOverview, ChapterSummary, SessionState
 # threshold, the PDF is likely scanned images rather than digital text.
 _SCAN_THRESHOLD_CHARS_PER_PAGE = 50
 
-# Early pages are the likeliest place for a table of contents or front matter
-# to mention many chapter headings before the real chapter 1 begins.
-_FRONT_MATTER_MAX_PAGE = 15
+# Front matter often contains TOC-like chapter mentions before the real
+# chapter 1 begins. Treat at least the first 15 pages, or the first 5% of
+# the book for longer PDFs, as the front-matter zone.
+_FRONT_MATTER_MIN_PAGES = 15
 
 # Minimum number of chapters required before a detection strategy is considered
 # credible. Two-chapter books are valid, but a single detected chapter is too
@@ -192,8 +193,15 @@ _TOC_CHAPTER_RE = re.compile(
     re.IGNORECASE,
 )
 _TOC_SECTION_START_RE = re.compile(r"^\s*(\d+)\.1(?:\s|$)")
-_TOC_GENERIC_NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
 _TOC_ROMAN_TITLE_RE = re.compile(r"^\s*[IVXLCDM]+\s*$", re.IGNORECASE)
+_TOC_TYPO_LEAD_RE = re.compile(
+    r"^\s*(\S+)\s+(\d+|[IVXLCDM]+)\b",
+    re.IGNORECASE,
+)
+_TOC_PUNCTUATED_NUMBER_RE = re.compile(
+    r"^\s*\S+\s+(\d+|[IVXLCDM]+)(?=\s*[:\-–—])",
+    re.IGNORECASE,
+)
 _TOC_FRONT_MATTER_TITLES = {
     "cover",
     "title page",
@@ -248,6 +256,13 @@ def _match_chapter_heading(line: str) -> tuple[int, str] | None:
     return None
 
 
+def _front_matter_limit(total_pages: int) -> int:
+    """Return how many leading pages should be treated as front matter."""
+    if total_pages <= 0:
+        return 0
+    return min(total_pages, max(_FRONT_MATTER_MIN_PAGES, (total_pages + 19) // 20))
+
+
 def _normalise_toc_title(title: str) -> str:
     return re.sub(r"\s+", " ", title).strip()
 
@@ -263,6 +278,22 @@ def _is_nonchapter_toc_title(title: str) -> bool:
     if norm.startswith("appendix"):
         return True
     return bool(_TOC_ROMAN_TITLE_RE.fullmatch(norm))
+
+
+def _looks_like_chapterish_toc_token(token: str) -> bool:
+    """Heuristic for common 'chapter' typos in TOC entries.
+
+    Keep this conservative: it should rescue obvious misspellings like
+    ``Chpater 20 ...`` without letting unrelated titles like ``Python 3 ...``
+    claim a chapter number.
+    """
+    cleaned = re.sub(r"[^a-z]", "", token.lower())
+    return (
+        len(cleaned) >= 6
+        and cleaned.startswith("ch")
+        and cleaned.endswith("ter")
+        and "p" in cleaned
+    )
 
 
 def _toc_title_candidates(
@@ -291,14 +322,20 @@ def _toc_title_candidates(
         if num > 0:
             candidates.append((2, num, cleaned))
 
-    # Last resort: salvage a chapter number from titles like "Chpater 3: ..."
-    # or foreign-language entries that still contain a single chapter number.
+    # Last resort: salvage a chapter number only when it still looks like the
+    # number is acting as the chapter label, not incidental content.
     if not candidates and not _is_nonchapter_toc_title(cleaned):
-        m = _TOC_GENERIC_NUMBER_RE.search(cleaned)
-        if m:
-            num = int(m.group(1))
+        m = _TOC_TYPO_LEAD_RE.match(cleaned)
+        if m and _looks_like_chapterish_toc_token(m.group(1)):
+            num = _parse_chapter_num(m.group(2))
             if num > 0:
                 candidates.append((1, num, cleaned))
+        else:
+            m = _TOC_PUNCTUATED_NUMBER_RE.match(cleaned)
+            if m:
+                num = _parse_chapter_num(m.group(1))
+                if num > 0:
+                    candidates.append((1, num, cleaned))
 
     return candidates
 
@@ -437,9 +474,10 @@ def _split_by_section_numbering(
     # A front-matter contents page often lists several N.1 section restarts
     # before the real chapter 1 begins. Treat any early page with multiple
     # distinct chapter numbers as TOC-like and ignore it for boundary picking.
+    front_matter_limit = _front_matter_limit(len(pages))
     toc_like_pages = {
         page_idx
-        for page_idx in range(min(len(pages), _FRONT_MATTER_MAX_PAGE + 1))
+        for page_idx in range(front_matter_limit)
         if len(page_section_nums.get(page_idx, set())) >= 2
     }
     filtered = [candidate for candidate in candidates if candidate[1] not in toc_like_pages]
@@ -450,7 +488,7 @@ def _split_by_section_numbering(
     seen_chapters: set[int] = set()
     max_seen = 0
     for chapter_num, page_idx in filtered:
-        if page_idx <= _FRONT_MATTER_MAX_PAGE and chapter_num < max_seen:
+        if page_idx < front_matter_limit and chapter_num < max_seen:
             boundaries.clear()
             seen_chapters.clear()
             max_seen = 0
@@ -536,21 +574,22 @@ def _split_by_regex(pages: list[str]) -> list[tuple[int, str, str]] | None:
         return None
 
     # Ignore likely TOC pages near the front of the PDF.
+    front_matter_limit = _front_matter_limit(len(pages))
     toc_like_pages = {
         page_idx
-        for page_idx in range(min(len(pages), _FRONT_MATTER_MAX_PAGE + 1))
+        for page_idx in range(front_matter_limit)
         if len({num for num, _, pg, _ in candidates if pg == page_idx}) >= 2
     }
     filtered = [c for c in candidates if c[2] not in toc_like_pages]
     if not filtered:
-        filtered = candidates
+        return None
 
     # Collapse duplicates.
     boundaries: list[tuple[int, str, int, int]] = []
     seen_chapters: set[int] = set()
     max_seen = 0
     for num, title, page_idx, char_offset in filtered:
-        if page_idx <= _FRONT_MATTER_MAX_PAGE and num < max_seen:
+        if page_idx < front_matter_limit and num < max_seen:
             boundaries.clear()
             seen_chapters.clear()
             max_seen = 0

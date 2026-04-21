@@ -15,8 +15,10 @@ import pytest
 from textbook_companion.ingest import (
     TocEntry,
     _match_chapter_heading,
+    _split_by_regex,
     _split_by_section_numbering,
     _split_by_toc,
+    _toc_title_candidates,
     extract_text,
     extract_toc,
     ingest_pdf,
@@ -276,6 +278,20 @@ def test_split_chapters_ignores_front_matter_toc_candidates() -> None:
     assert "TOC_FILL_1" not in result[0][2]
 
 
+def test_split_by_regex_returns_none_when_only_toc_like_candidates_exist() -> None:
+    toc_page = "\n".join(
+        [
+            "Contents",
+            "Chapter 1 Intro",
+            "Chapter 2 Variables",
+            "Chapter 3 Control Flow",
+            "BODY " * 120,
+        ]
+    )
+
+    assert _split_by_regex([toc_page]) is None
+
+
 # ---------------------------------------------------------------------------
 # split_chapters — fallback behaviour
 # ---------------------------------------------------------------------------
@@ -388,6 +404,14 @@ def test_split_by_toc_detects_foreign_keyword() -> None:
     nums = [r[0] for r in result]
     assert 4 in nums
     assert 5 in nums
+
+
+def test_toc_title_candidates_rejects_incidental_numbers() -> None:
+    assert _toc_title_candidates("Python 3 Overview") == []
+    assert _toc_title_candidates("2023 Preface") == []
+    assert _toc_title_candidates("Chpater 20 Recursion") == [
+        (1, 20, "Chpater 20 Recursion")
+    ]
 
 
 def test_split_by_toc_prefers_deeper_explicit_chapter_level() -> None:
@@ -615,6 +639,58 @@ def test_split_by_section_numbering_ignores_toc_like_front_matter() -> None:
     assert "1.1  Intro" in result[0][2]
     assert "REAL_CH1" in result[0][2]
     assert "Contents" not in result[0][2]
+
+
+def test_split_by_section_numbering_ignores_toc_like_page_beyond_legacy_cap() -> None:
+    toc_page = "\n".join(
+        [
+            "Contents",
+            "1.1 Intro",
+            "2.1 Variables",
+            "3.1 Control Flow",
+        ]
+    )
+    pages = [f"Front matter page {i}" for i in range(20)]
+    pages.append(toc_page)
+    pages.append(_make_section_page(1, "Intro", body="REAL_CH1 " * 40))
+    pages.extend(f"Interlude A{i}" for i in range(130))
+    pages.append(_make_section_page(2, "Variables", body="REAL_CH2 " * 40))
+    pages.extend(f"Interlude B{i}" for i in range(130))
+    pages.append(_make_section_page(3, "Control Flow", body="REAL_CH3 " * 40))
+    pages.extend(f"Interlude C{i}" for i in range(130))
+
+    result = _split_by_section_numbering(pages)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert "Contents" not in result[0][2]
+    assert "REAL_CH1" in result[0][2]
+
+
+def test_split_by_regex_ignores_toc_like_page_beyond_legacy_cap() -> None:
+    toc_page = "\n".join(
+        [
+            "Contents",
+            "Chapter 1 Intro",
+            "Chapter 2 Variables",
+            "Chapter 3 Control Flow",
+        ]
+    )
+    pages = [f"Front matter page {i}" for i in range(20)]
+    pages.append(toc_page)
+    pages.append("Chapter 1: Intro\n\n" + ("REAL_CH1 " * 40))
+    pages.extend(f"Interlude A{i}" for i in range(130))
+    pages.append("Chapter 2: Variables\n\n" + ("REAL_CH2 " * 40))
+    pages.extend(f"Interlude B{i}" for i in range(130))
+    pages.append("Chapter 3: Control Flow\n\n" + ("REAL_CH3 " * 40))
+    pages.extend(f"Interlude C{i}" for i in range(130))
+
+    result = _split_by_regex(pages)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert "Contents" not in result[0][2]
+    assert "REAL_CH1" in result[0][2]
 
 
 def test_split_chapters_uses_section_numbering_when_no_toc_and_no_keywords() -> None:
