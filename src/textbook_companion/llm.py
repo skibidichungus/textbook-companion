@@ -9,8 +9,10 @@ Structured output uses *forced tool use*: the Pydantic schema becomes a tool's
 tool call's `input` back through the schema. Anthropic has no JSON-mode flag
 like OpenAI; this is the canonical structured-output pattern.
 
-Prompt caching sets `cache_control={"type": "ephemeral"}` on the last system
-block. For Opus 4.7 the minimum cacheable prefix is 4096 tokens — below that,
+Prompt caching sets `cache_control={"type": "ephemeral"}` on every system
+block. Each entry in the system list becomes its own cached block, enabling
+fine-grained cache invalidation (e.g. stable overview + per-chapter content).
+For Sonnet 4.6 the minimum cacheable prefix is 4096 tokens — below that,
 caching silently no-ops, so we log a warning.
 """
 
@@ -21,17 +23,17 @@ import os
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
-# Opus 4.7's minimum cacheable prefix (tokens). Anything shorter cached
+# Sonnet 4.6's minimum cacheable prefix (tokens). Anything shorter cached
 # silently no-ops — cache_creation_input_tokens will be 0.
-MIN_CACHE_TOKENS_OPUS_4_7 = 4096
+MIN_CACHE_TOKENS_SONNET_4_6 = 2048
 
 DEFAULT_MAX_TOKENS = 16000
 
@@ -45,16 +47,17 @@ class LLMClient(Protocol):
 
     def chat(
         self,
-        system: str,
+        system: list[str],
         messages: list[dict[str, Any]],
         cache_system: bool = True,
     ) -> str: ...
 
     def structured(
         self,
-        system: str,
+        system: list[str],
         user: str,
         schema: type[T],
+        cache_system: bool = True,
     ) -> T: ...
 
 
@@ -83,7 +86,7 @@ class ClaudeClient:
 
     def chat(
         self,
-        system: str,
+        system: list[str],
         messages: list[dict[str, Any]],
         cache_system: bool = True,
     ) -> str:
@@ -100,10 +103,12 @@ class ClaudeClient:
 
     def structured(
         self,
-        system: str,
+        system: list[str],
         user: str,
         schema: type[T],
+        cache_system: bool = True,
     ) -> T:
+        system_blocks = self._build_system_blocks(system, cache_system)
         tool_name = _tool_name_for(schema)
         tool = {
             "name": tool_name,
@@ -113,32 +118,42 @@ class ClaudeClient:
         response = self._client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=system,
+            system=system_blocks,
             tools=[tool],
             tool_choice={"type": "tool", "name": tool_name},
             messages=[{"role": "user", "content": user}],
         )
         for block in response.content:
             if block.type == "tool_use" and block.name == tool_name:
-                return schema.model_validate(block.input)
+                try:
+                    return schema.model_validate(block.input)
+                except ValidationError as exc:
+                    raise StructuredOutputError(
+                        f"model emitted invalid '{tool_name}' payload: {exc}"
+                    ) from exc
         raise StructuredOutputError(
             f"model did not emit the forced tool call '{tool_name}'"
         )
 
     def _build_system_blocks(
-        self, system: str, cache_system: bool
+        self, system: list[str], cache_system: bool
     ) -> list[dict[str, Any]]:
-        block: dict[str, Any] = {"type": "text", "text": system}
         if cache_system:
-            if _estimate_tokens(system) < MIN_CACHE_TOKENS_OPUS_4_7:
+            total_tokens = sum(len(s) for s in system) // 4
+            if total_tokens < MIN_CACHE_TOKENS_SONNET_4_6:
                 logger.warning(
-                    "system prompt is below the %d-token minimum for Opus 4.7 "
+                    "system prompt is below the %d-token minimum for Sonnet 4.6 "
                     "prompt caching; cache_control will be accepted but will "
                     "silently no-op",
-                    MIN_CACHE_TOKENS_OPUS_4_7,
+                    MIN_CACHE_TOKENS_SONNET_4_6,
                 )
-            block["cache_control"] = {"type": "ephemeral"}
-        return [block]
+        blocks: list[dict[str, Any]] = []
+        for s in system:
+            block: dict[str, Any] = {"type": "text", "text": s}
+            if cache_system:
+                block["cache_control"] = {"type": "ephemeral"}
+            blocks.append(block)
+        return blocks
 
 
 def _tool_name_for(schema: type[BaseModel]) -> str:

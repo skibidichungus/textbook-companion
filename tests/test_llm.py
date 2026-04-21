@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from textbook_companion import llm
 from textbook_companion.llm import (
     DEFAULT_MODEL,
-    MIN_CACHE_TOKENS_OPUS_4_7,
+    MIN_CACHE_TOKENS_SONNET_4_6,
     ClaudeClient,
     LLMClient,
     StructuredOutputError,
@@ -51,18 +51,18 @@ def test_protocol_is_satisfied_by_claude_client() -> None:
     assert isinstance(client, LLMClient)
 
 
-def test_default_model_is_opus_4_7() -> None:
+def test_default_model_is_sonnet_4_6() -> None:
     with patch("textbook_companion.llm.anthropic"):
         client = ClaudeClient(api_key="fake-key")
-    assert client.model == "claude-opus-4-7"
-    assert DEFAULT_MODEL == "claude-opus-4-7"
+    assert client.model == "claude-sonnet-4-6"
+    assert DEFAULT_MODEL == "claude-sonnet-4-6"
 
 
-def test_chat_adds_cache_control_on_last_system_block() -> None:
+def test_chat_adds_cache_control_to_every_system_block() -> None:
     client, mock_sdk = _mock_claude_client([_block(type="text", text="hi")])
 
     client.chat(
-        system="x" * 20_000,  # long enough to be well above the cache threshold
+        system=["x" * 20_000],  # long enough to be well above the cache threshold
         messages=[{"role": "user", "content": "hello"}],
     )
 
@@ -71,14 +71,33 @@ def test_chat_adds_cache_control_on_last_system_block() -> None:
     assert isinstance(system, list) and len(system) == 1
     assert system[0]["type"] == "text"
     assert system[0]["cache_control"] == {"type": "ephemeral"}
-    assert kwargs["model"] == "claude-opus-4-7"
+    assert kwargs["model"] == "claude-sonnet-4-6"
+
+
+def test_chat_multiple_system_blocks_each_get_cache_control() -> None:
+    client, mock_sdk = _mock_claude_client([_block(type="text", text="hi")])
+
+    block_a = "a" * 10_000
+    block_b = "b" * 10_000
+    client.chat(
+        system=[block_a, block_b],
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    kwargs = mock_sdk.messages.create.call_args.kwargs
+    system = kwargs["system"]
+    assert isinstance(system, list) and len(system) == 2
+    assert system[0]["text"] == block_a
+    assert system[1]["text"] == block_b
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[1]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_chat_omits_cache_control_when_disabled() -> None:
     client, mock_sdk = _mock_claude_client([_block(type="text", text="hi")])
 
     client.chat(
-        system="x" * 20_000,
+        system=["x" * 20_000],
         messages=[{"role": "user", "content": "hello"}],
         cache_system=False,
     )
@@ -97,7 +116,7 @@ def test_chat_returns_concatenated_text_blocks_only() -> None:
     )
 
     out = client.chat(
-        system="s" * 20_000,
+        system=["s" * 20_000],
         messages=[{"role": "user", "content": "q"}],
     )
     assert out == "hello world"
@@ -107,10 +126,10 @@ def test_chat_warns_when_system_below_cache_threshold(caplog: pytest.LogCaptureF
     client, _ = _mock_claude_client([_block(type="text", text="hi")])
 
     with caplog.at_level(logging.WARNING, logger="textbook_companion.llm"):
-        client.chat(system="short prompt", messages=[{"role": "user", "content": "q"}])
+        client.chat(system=["short prompt"], messages=[{"role": "user", "content": "q"}])
 
     assert any(
-        "minimum for Opus 4.7 prompt caching" in rec.message for rec in caplog.records
+        "minimum for Sonnet 4.6 prompt caching" in rec.message for rec in caplog.records
     )
 
 
@@ -119,13 +138,13 @@ def test_chat_does_not_warn_when_caching_disabled(caplog: pytest.LogCaptureFixtu
 
     with caplog.at_level(logging.WARNING, logger="textbook_companion.llm"):
         client.chat(
-            system="short prompt",
+            system=["short prompt"],
             messages=[{"role": "user", "content": "q"}],
             cache_system=False,
         )
 
     assert not any(
-        "minimum for Opus 4.7 prompt caching" in rec.message for rec in caplog.records
+        "minimum for Sonnet 4.6 prompt caching" in rec.message for rec in caplog.records
     )
 
 
@@ -135,12 +154,29 @@ def test_chat_does_not_warn_when_system_above_threshold(
     client, _ = _mock_claude_client([_block(type="text", text="hi")])
 
     # roughly 5K tokens at ~4 chars/token estimate
-    big_system = "x" * (MIN_CACHE_TOKENS_OPUS_4_7 * 4 + 100)
+    big_system = "x" * (MIN_CACHE_TOKENS_SONNET_4_6 * 4 + 100)
     with caplog.at_level(logging.WARNING, logger="textbook_companion.llm"):
-        client.chat(system=big_system, messages=[{"role": "user", "content": "q"}])
+        client.chat(system=[big_system], messages=[{"role": "user", "content": "q"}])
 
     assert not any(
-        "minimum for Opus 4.7 prompt caching" in rec.message for rec in caplog.records
+        "minimum for Sonnet 4.6 prompt caching" in rec.message for rec in caplog.records
+    )
+
+
+def test_chat_warns_when_combined_system_below_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, _ = _mock_claude_client([_block(type="text", text="hi")])
+
+    # Each block tiny — combined still below threshold.
+    with caplog.at_level(logging.WARNING, logger="textbook_companion.llm"):
+        client.chat(
+            system=["tiny", "also tiny"],
+            messages=[{"role": "user", "content": "q"}],
+        )
+
+    assert any(
+        "minimum for Sonnet 4.6 prompt caching" in rec.message for rec in caplog.records
     )
 
 
@@ -159,7 +195,7 @@ def test_structured_forces_tool_use_and_passes_schema() -> None:
     )
 
     result = client.structured(
-        system="You return structured data.",
+        system=["You return structured data."],
         user="Extract: Ada, 36",
         schema=Person,
     )
@@ -176,7 +212,45 @@ def test_structured_forces_tool_use_and_passes_schema() -> None:
         }
     ]
     assert kwargs["messages"] == [{"role": "user", "content": "Extract: Ada, 36"}]
-    assert kwargs["model"] == "claude-opus-4-7"
+    assert kwargs["model"] == "claude-sonnet-4-6"
+
+
+def test_structured_passes_system_as_cached_blocks() -> None:
+    tool_name = _tool_name_for(Person)
+    client, mock_sdk = _mock_claude_client(
+        [_block(type="tool_use", name=tool_name, input={"name": "Ada", "age": 36})]
+    )
+
+    client.structured(
+        system=["stable block " * 1000, "chapter block " * 500],
+        user="Extract: Ada, 36",
+        schema=Person,
+    )
+
+    kwargs = mock_sdk.messages.create.call_args.kwargs
+    system = kwargs["system"]
+    assert isinstance(system, list) and len(system) == 2
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[1]["cache_control"] == {"type": "ephemeral"}
+    assert "stable block" in system[0]["text"]
+    assert "chapter block" in system[1]["text"]
+
+
+def test_structured_omits_cache_control_when_disabled() -> None:
+    tool_name = _tool_name_for(Person)
+    client, mock_sdk = _mock_claude_client(
+        [_block(type="tool_use", name=tool_name, input={"name": "Ada", "age": 36})]
+    )
+
+    client.structured(
+        system=["x" * 20_000],
+        user="Extract: Ada, 36",
+        schema=Person,
+        cache_system=False,
+    )
+
+    system = mock_sdk.messages.create.call_args.kwargs["system"]
+    assert "cache_control" not in system[0]
 
 
 def test_structured_validates_through_pydantic() -> None:
@@ -185,7 +259,7 @@ def test_structured_validates_through_pydantic() -> None:
     client, _ = _mock_claude_client(
         [_block(type="tool_use", name=tool_name, input={"name": "Ada", "age": "36"})]
     )
-    result = client.structured(system="s", user="u", schema=Person)
+    result = client.structured(system=["s"], user="u", schema=Person)
     assert result == Person(name="Ada", age=36)
 
 
@@ -194,14 +268,16 @@ def test_structured_raises_on_invalid_payload() -> None:
     client, _ = _mock_claude_client(
         [_block(type="tool_use", name=tool_name, input={"name": "Ada", "age": -1})]
     )
-    with pytest.raises(Exception):  # Pydantic ValidationError, or wrapper
-        client.structured(system="s", user="u", schema=Person)
+    with pytest.raises(StructuredOutputError) as excinfo:
+        client.structured(system=["s"], user="u", schema=Person)
+    assert "invalid" in str(excinfo.value)
+    assert tool_name in str(excinfo.value)
 
 
 def test_structured_raises_when_tool_use_missing() -> None:
     client, _ = _mock_claude_client([_block(type="text", text="I refuse.")])
     with pytest.raises(StructuredOutputError):
-        client.structured(system="s", user="u", schema=Person)
+        client.structured(system=["s"], user="u", schema=Person)
 
 
 def test_tool_name_for_sanitises_class_name() -> None:
@@ -213,7 +289,7 @@ def test_tool_name_for_sanitises_class_name() -> None:
     assert all(c.isalnum() or c == "_" for c in name)
 
 
-# --- Live smoke test -----------------------------------------------------
+# --- Live smoke tests -----------------------------------------------------
 
 
 @pytest.mark.live
@@ -224,10 +300,10 @@ def test_live_chat_roundtrip() -> None:
 
     client = ClaudeClient()
     out = client.chat(
-        system=(
+        system=[
             "You are a terse test oracle. When the user says 'ping', reply with "
             "exactly the single word: pong. Do not add punctuation."
-        ),
+        ],
         messages=[{"role": "user", "content": "ping"}],
         cache_system=False,  # system prompt is tiny, skip the caching warning
     )
@@ -242,7 +318,7 @@ def test_live_structured_roundtrip() -> None:
 
     client = ClaudeClient()
     person = client.structured(
-        system="Extract a Person from the user's text. Use whatever values you see.",
+        system=["Extract a Person from the user's text. Use whatever values you see."],
         user="Her name is Ada Lovelace and she is 36.",
         schema=Person,
     )

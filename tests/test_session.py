@@ -27,7 +27,7 @@ from textbook_companion.session import Session
 @dataclass
 class FakeLLMCall:
     method: str
-    system: str
+    system: list[str]
     payload: Any
 
 
@@ -47,7 +47,7 @@ class FakeLLM:
         self.calls: list[FakeLLMCall] = []
 
     def chat(
-        self, system: str, messages: list[dict[str, Any]], cache_system: bool = True
+        self, system: list[str], messages: list[dict[str, Any]], cache_system: bool = True
     ) -> str:
         self.calls.append(FakeLLMCall("chat", system, messages))
         val = next(self._chat)
@@ -55,7 +55,13 @@ class FakeLLM:
             raise val
         return val  # type: ignore[no-any-return]
 
-    def structured(self, system: str, user: str, schema: type[BaseModel]) -> BaseModel:
+    def structured(
+        self,
+        system: list[str],
+        user: str,
+        schema: type[BaseModel],
+        cache_system: bool = True,
+    ) -> BaseModel:
         self.calls.append(FakeLLMCall("structured", system, user))
         val = next(self._structured)
         if isinstance(val, Exception):
@@ -130,6 +136,18 @@ def test_greeting_with_active_chapter(data_root: Path) -> None:
     session, lines = _make_session(data_root, FakeLLM())
     session._greet()
     assert any("left off in ch5" in l for l in lines)
+
+
+def test_greeting_uses_latest_completion_timestamp(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.chapters_completed = {
+        10: "2026-04-10T00:00:00+00:00",
+        2: "2026-04-20T00:00:00+00:00",
+    }
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session._greet()
+    assert any("Last completed: ch2" in l for l in lines)
 
 
 # --- starting chN --------------------------------------------------------
@@ -357,12 +375,12 @@ def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
 
     # LLM calls: recap (chat) + quiz (structured) + 2 feedback (chat per answer).
     assert [c.method for c in llm.calls] == ["chat", "structured", "chat", "chat"]
-    assert '"chapter_num": 5' in llm.calls[0].system
-    assert '"chapter_num": 5' in llm.calls[1].system
-    assert "Recap instructions" in llm.calls[0].system
-    assert "Quiz instructions" in llm.calls[1].system
-    assert "Quiz feedback instructions" in llm.calls[2].system
-    assert "Quiz feedback instructions" in llm.calls[3].system
+    assert any('"chapter_num": 5' in s for s in llm.calls[0].system)
+    assert any('"chapter_num": 5' in s for s in llm.calls[1].system)
+    assert any("Recap instructions" in s for s in llm.calls[0].system)
+    assert any("Quiz instructions" in s for s in llm.calls[1].system)
+    assert any("Quiz feedback instructions" in s for s in llm.calls[2].system)
+    assert any("Quiz feedback instructions" in s for s in llm.calls[3].system)
     # Feedback user messages carry both the question and the student's answer.
     assert "Why use functions?" in llm.calls[2].payload[0]["content"]
     assert "because DRY" in llm.calls[2].payload[0]["content"]
@@ -539,7 +557,7 @@ def test_ask_calls_llm_and_logs_question_and_answer(data_root: Path) -> None:
 
     # Exactly one chat call; system prompt contained the active chapter JSON.
     assert [c.method for c in llm.calls] == ["chat"]
-    assert '"chapter_num": 5' in llm.calls[0].system
+    assert any('"chapter_num": 5' in s for s in llm.calls[0].system)
 
     # Log has a single 'question' entry with the answer in metadata.
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
@@ -699,6 +717,20 @@ def test_api_error_during_chat_does_not_crash_loop(data_root: Path) -> None:
     assert "bye." in joined
 
 
+def test_api_error_during_structured_call_does_not_crash_loop(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=["recap"],
+        structured_returns=[StructuredOutputError("bad structured payload")],
+    )
+    session, lines = _make_session(data_root, llm, inputs=["done ch5", "quit"])
+
+    session.run()
+    joined = "\n".join(lines)
+    assert "API error:" in joined
+    assert "bad structured payload" in joined
+    assert "bye." in joined
+
+
 # --- run() loop smoke ----------------------------------------------------
 
 
@@ -719,3 +751,18 @@ def test_run_loop_handles_unknown_commands(data_root: Path) -> None:
     )
     session.run()
     assert any("Unknown command" in l for l in lines)
+
+
+def test_run_loop_exits_cleanly_on_eof_during_nested_prompt(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 3
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(data_root, FakeLLM(), inputs=["starting ch5"])
+    session.run()
+
+    assert lines[-1] == ""
+    assert not any("bye." in l for l in lines)
+
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 3

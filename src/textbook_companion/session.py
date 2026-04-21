@@ -70,6 +70,10 @@ class Session:
         self.end_of_chapter_quiz_prompt = _read_prompt("end_of_chapter_quiz.txt")
         self.quiz_feedback_prompt = _read_prompt("quiz_feedback.txt")
 
+        # Stable block: session prompt + book overview. Doesn't change within a
+        # run, so compute once and reuse across every LLM call.
+        self._stable_system_cached = self._stable_system()
+
         # {label: chapter_num} — built once so `attempting <label>` can detect
         # mis-attribution (e.g., typing `1.1` while active chapter is ch2).
         self._problem_owner = self._build_problem_owner_map()
@@ -90,6 +94,9 @@ class Session:
                 return
             try:
                 self._dispatch(cmd)
+            except EOFError:
+                self.out("")
+                return
             except LLMError as e:
                 self.out(f"API error: {e}")
 
@@ -192,33 +199,32 @@ class Session:
         if ch is None:
             return
 
-        base_sys = self._base_system(ch)
+        stable = self._stable_system_cached
+        chapter_block = self._chapter_system(ch)
 
         # 1. Recap
         self.out(f"\n== Recap for ch{n}: {ch.chapter_title} ==")
-        recap_sys = base_sys + "\n\n" + self.chapter_recap_prompt
         recap = self.llm.chat(
-            system=recap_sys,
+            system=[stable, chapter_block, self.chapter_recap_prompt],
             messages=[{"role": "user", "content": f"Recap ch{n}."}],
             cache_system=True,
         )
         self.out(recap)
 
         # 2. Quiz
-        quiz_sys = base_sys + "\n\n" + self.end_of_chapter_quiz_prompt
         quiz = self.llm.structured(
-            system=quiz_sys,
+            system=[stable, chapter_block, self.end_of_chapter_quiz_prompt],
             user=f"Generate 2-3 quiz questions for ch{n}.",
             schema=QuizSet,
+            cache_system=True,
         )
         if quiz.questions:
-            feedback_sys = base_sys + "\n\n" + self.quiz_feedback_prompt
             self.out(f"\n== Quiz ({len(quiz.questions)} questions) ==")
             for i, q in enumerate(quiz.questions, 1):
                 self.out(f"Q{i}: {q}")
                 answer = self.ask("A: ").strip()
                 feedback = self.llm.chat(
-                    system=feedback_sys,
+                    system=[stable, chapter_block, self.quiz_feedback_prompt],
                     messages=[
                         {
                             "role": "user",
@@ -322,7 +328,7 @@ class Session:
         if ch is None:
             return
         answer = self.llm.chat(
-            system=self._base_system(ch),
+            system=[self._stable_system_cached, self._chapter_system(ch)],
             messages=[{"role": "user", "content": question}],
             cache_system=True,
         )
@@ -419,7 +425,10 @@ class Session:
                 msg += f" Also in progress: {others_str}."
             self.out(msg)
         elif self.state.chapters_completed:
-            latest = max(self.state.chapters_completed)
+            latest = max(
+                self.state.chapters_completed.items(),
+                key=lambda item: datetime.fromisoformat(item[1]),
+            )[0]
             self.out(f"No active chapter. Last completed: ch{latest}.")
         else:
             self.out("No progress yet — start with `starting ch1`.")
@@ -470,11 +479,16 @@ class Session:
                 stale.append(prereq_num)
         return stale
 
-    def _base_system(self, chapter: ChapterSummary) -> str:
+    def _stable_system(self) -> str:
         parts = [
             self.session_system_prompt.rstrip(),
             "# Book Overview",
             json.dumps(self.book_overview.model_dump(), indent=2),
+        ]
+        return "\n\n".join(parts)
+
+    def _chapter_system(self, chapter: ChapterSummary) -> str:
+        parts = [
             "# Active Chapter",
             json.dumps(chapter.model_dump(), indent=2),
         ]
@@ -506,7 +520,7 @@ class Session:
 
 def main() -> None:
     # The LLM client logs a cache-threshold warning when a system prompt is
-    # below Opus 4.7's 4096-token minimum. Useful for development, ugly
+    # below Sonnet 4.6's 2048-token minimum. Useful for development, ugly
     # mid-conversation. Suppress by default; set TC_DEBUG=1 to see it.
     llm_log_level = logging.DEBUG if os.environ.get("TC_DEBUG") else logging.ERROR
     logging.getLogger("textbook_companion.llm").setLevel(llm_log_level)
