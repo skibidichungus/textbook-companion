@@ -260,6 +260,22 @@ Tests: updated `test_done_flow_logs_and_marks_complete` to assert the new call o
 
 Stop and report.
 
+### M4.9 — Problem label attribution check
+
+Fixes an attribution footgun: typing `attempting 1.1` while reading ch2 used to silently log a `problem_attempt` for ch2, even though "1.1" is obviously a ch1 problem.
+
+Mechanism:
+
+- At `Session.__init__`, scan every chapter's `end_of_chapter_problems` and build `self._problem_owner: dict[str, int]` mapping each problem label (the first whitespace-separated token of the problem string, e.g. `"1.1"`) to its chapter number. Earliest wins on duplicates.
+- `cmd_attempting(label)` extracts the first token of the user's input and consults the map:
+  - **Matches current chapter:** silent log, same as before.
+  - **Matches a different chapter:** confirm prompt *"'1.1' looks like a ch1 problem, not your current ch2. Log under ch1 instead? [y/N]"*. Yes → log under the owner; No → log under current. `current_chapter` never changes either way.
+  - **Not in the map:** one-line warning *"No problem matching 'X' found in any chapter. Logging under chN anyway."* then log under current — accommodates extra problems off-book or different numbering.
+
+Tests cover all four cases plus a map-construction spot-check (`test_problem_owner_map_built_at_init`). 101 tests total.
+
+Stop and report.
+
 ### M5 — Polish
 
 - `README.md`: install (`uv sync`), env setup, run command, the full command list with one-line descriptions

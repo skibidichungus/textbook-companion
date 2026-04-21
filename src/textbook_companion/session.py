@@ -70,6 +70,10 @@ class Session:
         self.end_of_chapter_quiz_prompt = _read_prompt("end_of_chapter_quiz.txt")
         self.quiz_feedback_prompt = _read_prompt("quiz_feedback.txt")
 
+        # {label: chapter_num} — built once so `attempting <label>` can detect
+        # mis-attribution (e.g., typing `1.1` while active chapter is ch2).
+        self._problem_owner = self._build_problem_owner_map()
+
     # ----- event loop -----
 
     def run(self) -> None:
@@ -349,9 +353,31 @@ class Session:
                 "No active chapter. Start one with `starting ch<N>` first."
             )
             return
-        self._log(chapter_num, "problem_attempt", label, metadata={})
+
+        first_token = label.split(None, 1)[0] if label else ""
+        owner = self._problem_owner.get(first_token)
+
+        target = chapter_num
+        if owner is None:
+            # Label doesn't match any known problem. Could be a different
+            # numbering scheme or an extra problem off-book; warn and log
+            # under the current chapter anyway.
+            self.out(
+                f"No problem matching '{first_token}' found in any chapter. "
+                f"Logging under ch{chapter_num} anyway."
+            )
+        elif owner != chapter_num:
+            answer = self.ask(
+                f"'{first_token}' looks like a ch{owner} problem, not your "
+                f"current ch{chapter_num}. Log under ch{owner} instead? "
+                f"[y/N] "
+            ).strip().lower()
+            if answer.startswith("y"):
+                target = owner
+
+        self._log(target, "problem_attempt", label, metadata={})
         self._save_state()
-        self.out(f"Logged problem attempt '{label}' for ch{chapter_num}.")
+        self.out(f"Logged problem attempt '{label}' for ch{target}.")
 
     def cmd_status(self) -> None:
         if self.state.current_chapter is not None:
@@ -400,6 +426,29 @@ class Session:
         if self.state.struggle_flags:
             terms = ", ".join(sorted(self.state.struggle_flags.keys()))
             self.out(f"Active struggle flags: {terms}")
+
+    def _build_problem_owner_map(self) -> dict[str, int]:
+        """Scan every chapter and map each problem's label → its chapter.
+
+        The label is the first whitespace-separated token of the problem
+        string, which matches Gaddis's convention (`"1.1 Write a program..."`
+        → `"1.1"`). Used by `cmd_attempting` to detect mis-attribution.
+        If the same label appears in multiple chapters, the earliest wins.
+        """
+        owners: dict[str, int] = {}
+        for n in range(1, self.book_overview.total_chapters + 1):
+            try:
+                ch = storage.load_chapter(self.data_root, self.book_id, n)
+            except FileNotFoundError:
+                continue
+            for problem_string in ch.end_of_chapter_problems:
+                parts = problem_string.split(None, 1)
+                if not parts:
+                    continue
+                label = parts[0]
+                if label not in owners:
+                    owners[label] = n
+        return owners
 
     def _load_chapter(self, n: int) -> ChapterSummary | None:
         try:

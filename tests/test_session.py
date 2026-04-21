@@ -595,14 +595,19 @@ def test_note_requires_active_chapter(data_root: Path) -> None:
 # --- attempting ---------------------------------------------------------
 
 
-def test_attempting_logs_problem_attempt_entry(data_root: Path) -> None:
+def test_attempting_matching_current_chapter_is_silent(data_root: Path) -> None:
+    # 5.4 is a real problem in ch5's fixture; no warning, no prompt.
     state = storage.load_session_state(data_root, BOOK_ID)
     state.current_chapter = 5
     storage.save_session_state(data_root, state)
 
     session, lines = _make_session(data_root, FakeLLM())
     session.cmd_attempting("5.4")
-    assert any("Logged problem attempt '5.4' for ch5" in l for l in lines)
+    joined = "\n".join(lines)
+    assert "Logged problem attempt '5.4' for ch5" in joined
+    # No mismatch prompt, no warning.
+    assert "looks like a ch" not in joined
+    assert "No problem matching" not in joined
 
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
     assert len(entries) == 1
@@ -610,7 +615,52 @@ def test_attempting_logs_problem_attempt_entry(data_root: Path) -> None:
     assert entry.entry_type == "problem_attempt"
     assert entry.chapter_num == 5
     assert entry.content == "5.4"
-    assert entry.metadata == {}
+
+
+def test_attempting_mismatch_reroute_accepted(data_root: Path) -> None:
+    # current = ch2, label = 1.1 (a ch1 problem). User accepts reroute.
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 2
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM(), inputs=["y"])
+    session.cmd_attempting("1.1")
+
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    assert entries[0].chapter_num == 1  # rerouted to owner
+    # current_chapter is untouched — still ch2.
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 2
+    assert any("Logged problem attempt '1.1' for ch1" in l for l in lines)
+
+
+def test_attempting_mismatch_reroute_declined(data_root: Path) -> None:
+    # current = ch2, label = 1.1 (a ch1 problem). User declines reroute.
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 2
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM(), inputs=["n"])
+    session.cmd_attempting("1.1")
+
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    assert entries[0].chapter_num == 2  # stayed with current
+    assert any("Logged problem attempt '1.1' for ch2" in l for l in lines)
+
+
+def test_attempting_unknown_label_warns_and_logs_under_current(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_attempting("99.99")
+
+    joined = "\n".join(lines)
+    assert "No problem matching '99.99' found" in joined
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    assert entries[0].chapter_num == 5
 
 
 def test_attempting_requires_active_chapter(data_root: Path) -> None:
@@ -619,6 +669,16 @@ def test_attempting_requires_active_chapter(data_root: Path) -> None:
     assert any("No active chapter" in l for l in lines)
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
     assert entries == []
+
+
+def test_problem_owner_map_built_at_init(data_root: Path) -> None:
+    session, _ = _make_session(data_root, FakeLLM())
+    # Spot-check: labels from ch1, ch2, ch5 fixtures should map to those
+    # chapters; unknown label should be absent.
+    assert session._problem_owner["1.1"] == 1
+    assert session._problem_owner["2.1"] == 2
+    assert session._problem_owner["5.1"] == 5
+    assert "99.99" not in session._problem_owner
 
 
 # --- API error handling --------------------------------------------------
