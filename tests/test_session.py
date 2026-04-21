@@ -183,6 +183,141 @@ def test_starting_unknown_chapter(data_root: Path) -> None:
     assert reloaded.current_chapter is None
 
 
+def test_starting_same_chapter_is_noop(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_starting(5)
+    assert any("Already reading ch5" in l for l in lines)
+    # Deps output skipped.
+    assert not any("Depends on:" in l for l in lines)
+
+
+def test_starting_abandoning_incomplete_chapter_declined(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 3
+    storage.save_session_state(data_root, state)
+    # The confirm prompt comes through ask(); answer 'n' to decline.
+    session, lines = _make_session(data_root, FakeLLM(), inputs=["n"])
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 3  # did NOT switch
+    assert any("Staying on ch3" in l for l in lines)
+
+
+def test_starting_abandoning_incomplete_chapter_confirmed(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 3
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM(), inputs=["y"])
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 5  # switched
+    # ch3 stays uncompleted — user can come back.
+    assert 3 not in reloaded.chapters_completed
+
+
+def test_starting_from_completed_chapter_switches_without_confirm(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 3
+    state.chapters_completed[3] = datetime.now(timezone.utc).isoformat()
+    storage.save_session_state(data_root, state)
+    # No input scripted — no confirm prompt should be asked.
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert reloaded.current_chapter == 5
+
+
+def test_starting_revisiting_completed_chapter_announces(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.chapters_completed[2] = datetime.now(timezone.utc).isoformat()
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_starting(2)
+    assert any("Revisiting ch2" in l and "already completed" in l for l in lines)
+
+
+# --- in-progress tracking -----------------------------------------------
+
+
+def test_starting_marks_chapter_in_progress(data_root: Path) -> None:
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert 5 in reloaded.chapters_in_progress
+    # Value is an ISO timestamp.
+    assert reloaded.chapters_in_progress[5]
+
+
+def test_revisiting_completed_chapter_does_not_reopen_in_progress(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.chapters_completed[2] = datetime.now(timezone.utc).isoformat()
+    storage.save_session_state(data_root, state)
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_starting(2)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert 2 not in reloaded.chapters_in_progress
+    assert 2 in reloaded.chapters_completed
+
+
+def test_abandoning_leaves_previous_chapter_in_progress(data_root: Path) -> None:
+    # Abandon ch3 mid-flight, switch to ch5. ch3 should still be in progress.
+    session, _ = _make_session(data_root, FakeLLM())
+    session.cmd_starting(3)
+    # User confirms the switch:
+    session.ask = scripted_ask(["y"])
+    session.cmd_starting(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert set(reloaded.chapters_in_progress) == {3, 5}
+    assert reloaded.current_chapter == 5
+
+
+def test_done_removes_chapter_from_in_progress(data_root: Path) -> None:
+    llm = FakeLLM(
+        chat_returns=["recap"],
+        structured_returns=[_QuizReturn([])],
+    )
+    session, _ = _make_session(data_root, llm, inputs=[""])  # blank reflection
+    session.cmd_starting(5)
+    session.cmd_done(5)
+    reloaded = storage.load_session_state(data_root, BOOK_ID)
+    assert 5 not in reloaded.chapters_in_progress
+    assert 5 in reloaded.chapters_completed
+
+
+def test_status_shows_in_progress_section(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    state.chapters_in_progress = {
+        3: "2026-04-15T10:00:00Z",
+        5: "2026-04-20T10:00:00Z",
+    }
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_status()
+    joined = "\n".join(lines)
+    assert "In progress:" in joined
+    assert "ch3:" in joined
+    assert "ch5:" in joined
+
+
+def test_greeting_mentions_other_in_progress_chapters(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    state.chapters_in_progress = {
+        3: "2026-04-15T10:00:00Z",
+        5: "2026-04-20T10:00:00Z",
+    }
+    storage.save_session_state(data_root, state)
+    session, lines = _make_session(data_root, FakeLLM())
+    session._greet()
+    joined = "\n".join(lines)
+    assert "left off in ch5" in joined
+    assert "Also in progress: ch3" in joined
+
+
 # --- done chN ------------------------------------------------------------
 
 
@@ -191,12 +326,12 @@ def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
         chat_returns=["Recap of ch5: functions etc."],
         structured_returns=[_QuizReturn(["Why use functions?", "What is scope?"])],
     )
-    # Scripted: 2 quiz answers, then reaction, then problems attempted
+    # Scripted: 2 quiz answers, then reflection. No more batch problem-attempts
+    # question — that's logged in-the-moment via `attempting <label>`.
     inputs = [
         "because DRY",      # A1
         "local variables",  # A2
-        "liked this one",   # reaction
-        "1, 3",             # problems attempted (indices)
+        "liked this one",   # reflection
     ]
     session, lines = _make_session(data_root, llm, inputs=inputs)
     session.cmd_done(5)
@@ -205,45 +340,25 @@ def test_done_flow_logs_and_marks_complete(data_root: Path) -> None:
     reloaded = storage.load_session_state(data_root, BOOK_ID)
     assert 5 in reloaded.chapters_completed
 
-    # Log has quiz_answer x2, reaction x1, problem_attempt x2.
+    # Log has quiz_answer x2, reflection x1. No more batch problem_attempt entries.
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
     types = [e.entry_type for e in entries]
-    assert types == [
-        "quiz_answer",
-        "quiz_answer",
-        "reaction",
-        "problem_attempt",
-        "problem_attempt",
-    ]
-    # Quiz answers carry the question text in metadata.
+    assert types == ["quiz_answer", "quiz_answer", "reflection"]
     quiz_entries = [e for e in entries if e.entry_type == "quiz_answer"]
     assert quiz_entries[0].metadata["question"] == "Why use functions?"
     assert quiz_entries[0].metadata["q_num"] == 1
 
     # LLM was called: 1 chat (recap) + 1 structured (quiz).
     assert [c.method for c in llm.calls] == ["chat", "structured"]
-    # System prompts contained the chapter JSON (active chapter block).
     assert '"chapter_num": 5' in llm.calls[0].system
     assert '"chapter_num": 5' in llm.calls[1].system
-    # Recap call includes the recap instructions; quiz call includes quiz instructions.
     assert "Recap instructions" in llm.calls[0].system
     assert "Quiz instructions" in llm.calls[1].system
 
-
-def test_done_flow_skips_problems_section_when_chapter_has_none(data_root: Path) -> None:
-    # ch6 is a sparse chapter with no end_of_chapter_problems.
-    llm = FakeLLM(
-        chat_returns=["Recap of ch6."],
-        structured_returns=[_QuizReturn(["q?"])],
-    )
-    inputs = [
-        "my answer",  # A1
-        "",           # no reaction
-        # no "problems" prompt should appear, so no more inputs expected
-    ]
-    session, lines = _make_session(data_root, llm, inputs=inputs)
-    session.cmd_done(6)
+    # UX: the reflections prompt uses the new wording.
     joined = "\n".join(lines)
+    assert "reflections" in joined.lower()
+    # And the old batch problems question is gone.
     assert "Which end-of-chapter problems" not in joined
 
 
@@ -253,12 +368,11 @@ def test_done_flow_skips_quiz_section_when_no_questions(data_root: Path) -> None
         structured_returns=[_QuizReturn([])],  # empty quiz
     )
     inputs = [
-        "",         # reaction skipped
-        "",         # problems blank
+        "",  # reflection skipped
     ]
     session, _ = _make_session(data_root, llm, inputs=inputs)
     session.cmd_done(5)
-    # No quiz_answer entries logged.
+    # No quiz_answer, no reflection.
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
     assert [e.entry_type for e in entries] == []
 
@@ -436,6 +550,35 @@ def test_note_logs_entry_and_does_not_call_llm(data_root: Path) -> None:
 def test_note_requires_active_chapter(data_root: Path) -> None:
     session, lines = _make_session(data_root, FakeLLM())
     session.cmd_note("untethered thought")
+    assert any("No active chapter" in l for l in lines)
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert entries == []
+
+
+# --- attempting ---------------------------------------------------------
+
+
+def test_attempting_logs_problem_attempt_entry(data_root: Path) -> None:
+    state = storage.load_session_state(data_root, BOOK_ID)
+    state.current_chapter = 5
+    storage.save_session_state(data_root, state)
+
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_attempting("5.4")
+    assert any("Logged problem attempt '5.4' for ch5" in l for l in lines)
+
+    entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.entry_type == "problem_attempt"
+    assert entry.chapter_num == 5
+    assert entry.content == "5.4"
+    assert entry.metadata == {}
+
+
+def test_attempting_requires_active_chapter(data_root: Path) -> None:
+    session, lines = _make_session(data_root, FakeLLM())
+    session.cmd_attempting("5.4")
     assert any("No active chapter" in l for l in lines)
     entries = storage.read_log(storage.reading_log_path(data_root, BOOK_ID))
     assert entries == []

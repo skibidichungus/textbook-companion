@@ -129,7 +129,7 @@ def test_append_log_one_line_per_entry(tmp_path: Path) -> None:
             timestamp=f"2026-04-18T10:00:0{i}Z",
             book_id="gaddis_python_6e",
             chapter_num=5,
-            entry_type="reaction",
+            entry_type="reflection",
             content=f"note {i}",
             metadata={"i": i},
         )
@@ -156,7 +156,7 @@ def test_append_log_preserves_existing_lines(tmp_path: Path) -> None:
     log = storage.reading_log_path(tmp_path, "gaddis_python_6e")
     first = LogEntry(
         timestamp="t1", book_id="gaddis_python_6e", chapter_num=1,
-        entry_type="reaction", content="first", metadata={},
+        entry_type="reflection", content="first", metadata={},
     )
     second = LogEntry(
         timestamp="t2", book_id="gaddis_python_6e", chapter_num=1,

@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 EntryType = Literal[
-    "reaction",
+    "reflection",
     "quiz_answer",
     "struggle_flag",
     "problem_attempt",
@@ -83,6 +83,10 @@ class ConceptGraph(BaseModel):
 class SessionState(BaseModel):
     book_id: str
     current_chapter: int | None = None
+    # Chapters started but not yet `done`. Keyed by chapter_num, value is the
+    # ISO timestamp of when the chapter was first started. Preserves the
+    # "I was also reading chM" signal across chapter switches.
+    chapters_in_progress: dict[int, str] = Field(default_factory=dict)
     chapters_completed: dict[int, str] = Field(default_factory=dict)
     struggle_flags: dict[str, list[int]] = Field(default_factory=dict)
     last_active: str

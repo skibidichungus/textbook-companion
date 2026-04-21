@@ -8,6 +8,8 @@ the LLM only through the `LLMClient` protocol.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +106,8 @@ class Session:
                 self.cmd_ask(question)
             case commands.Note(text):
                 self.cmd_note(text)
+            case commands.Attempting(label):
+                self.cmd_attempting(label)
             case commands.Status():
                 self.cmd_status()
             case commands.Unknown(raw):
@@ -113,12 +117,58 @@ class Session:
     # ----- commands -----
 
     def cmd_starting(self, n: int) -> None:
+        current = self.state.current_chapter
+
+        # Already on this chapter — silently no-op with a clear message,
+        # skip deps/refresher spam.
+        if current == n:
+            self.out(f"Already reading ch{n}.")
+            return
+
         ch = self._load_chapter(n)
         if ch is None:
             return
+
+        # Abandoning an incomplete chapter. Confirm before overwriting
+        # current_chapter — catches fat-finger typos and makes deliberate
+        # jumps explicit.
+        if (
+            current is not None
+            and current not in self.state.chapters_completed
+        ):
+            answer = self.ask(
+                f"You're currently reading ch{current} (not marked complete). "
+                f"Switch to ch{n} anyway? [y/N] "
+            ).strip().lower()
+            if not answer.startswith("y"):
+                self.out(f"Staying on ch{current}.")
+                return
+
+        revisiting = n in self.state.chapters_completed
+        # Mark in-progress on first real start. Revisiting a completed
+        # chapter does NOT put it back in progress — you're already done.
+        if not revisiting and n not in self.state.chapters_in_progress:
+            self.state.chapters_in_progress[n] = _now_iso()
         self.state.current_chapter = n
         self._save_state()
-        self.out(f"Starting ch{n}: {ch.chapter_title}")
+
+        if revisiting:
+            self.out(
+                f"Revisiting ch{n}: {ch.chapter_title} (already completed)."
+            )
+        elif n in self.state.chapters_in_progress and len(
+            self.state.chapters_in_progress
+        ) > 1:
+            # The user has other chapters still in progress — worth flagging.
+            others = sorted(
+                m for m in self.state.chapters_in_progress if m != n
+            )
+            others_str = ", ".join(f"ch{m}" for m in others)
+            self.out(f"Starting ch{n}: {ch.chapter_title}")
+            self.out(f"(Also in progress: {others_str})")
+        else:
+            self.out(f"Starting ch{n}: {ch.chapter_title}")
+
         if ch.depends_on_chapters:
             deps = ", ".join(f"ch{d}" for d in ch.depends_on_chapters)
             self.out(f"Depends on: {deps}")
@@ -168,28 +218,20 @@ class Session:
                     metadata={"question": q, "q_num": i},
                 )
 
-        # 3. Reactions
-        self.out("\nAny reactions? (blank to skip)")
-        reaction = self.ask("> ").strip()
-        if reaction:
-            self._log(n, "reaction", reaction, metadata={})
+        # 3. Reflections
+        self.out(
+            "\nAny reflections on this chapter? "
+            "(what clicked, what didn't — blank to skip)"
+        )
+        reflection = self.ask("> ").strip()
+        if reflection:
+            self._log(n, "reflection", reflection, metadata={})
 
-        # 4. Problems attempted
-        if ch.end_of_chapter_problems:
-            self.out(
-                "\nWhich end-of-chapter problems did you attempt? "
-                "(comma-separated, blank = none)"
-            )
-            for i, p in enumerate(ch.end_of_chapter_problems, 1):
-                self.out(f"  {i}. {p}")
-            raw = self.ask("> ").strip()
-            if raw:
-                entries = [e.strip() for e in raw.split(",") if e.strip()]
-                for e in entries:
-                    self._log(n, "problem_attempt", e, metadata={})
-
-        # 5. Mark complete
+        # 4. Mark complete
+        # Problems aren't asked here — log them in-the-moment with
+        # `attempting <label>` while you're actually working them.
         self.state.chapters_completed[n] = _now_iso()
+        self.state.chapters_in_progress.pop(n, None)
         self._save_state()
         self.out(f"\nch{n} marked complete.")
 
@@ -283,11 +325,28 @@ class Session:
         self._save_state()
         self.out(f"Note logged for ch{chapter_num}.")
 
+    def cmd_attempting(self, label: str) -> None:
+        chapter_num = self.state.current_chapter
+        if chapter_num is None:
+            self.out(
+                "No active chapter. Start one with `starting ch<N>` first."
+            )
+            return
+        self._log(chapter_num, "problem_attempt", label, metadata={})
+        self._save_state()
+        self.out(f"Logged problem attempt '{label}' for ch{chapter_num}.")
+
     def cmd_status(self) -> None:
         if self.state.current_chapter is not None:
             self.out(f"Current chapter: ch{self.state.current_chapter}")
         else:
             self.out("Current chapter: (none)")
+        if self.state.chapters_in_progress:
+            self.out("In progress:")
+            for n in sorted(self.state.chapters_in_progress):
+                self.out(
+                    f"  ch{n}: started {self.state.chapters_in_progress[n]}"
+                )
         if self.state.chapters_completed:
             self.out("Completed:")
             for n in sorted(self.state.chapters_completed):
@@ -306,7 +365,16 @@ class Session:
         bo = self.book_overview
         self.out(f"Textbook Companion — {bo.title} ({bo.edition}), {bo.author}")
         if self.state.current_chapter is not None:
-            self.out(f"You left off in ch{self.state.current_chapter}.")
+            msg = f"You left off in ch{self.state.current_chapter}."
+            others = sorted(
+                n
+                for n in self.state.chapters_in_progress
+                if n != self.state.current_chapter
+            )
+            if others:
+                others_str = ", ".join(f"ch{n}" for n in others)
+                msg += f" Also in progress: {others_str}."
+            self.out(msg)
         elif self.state.chapters_completed:
             latest = max(self.state.chapters_completed)
             self.out(f"No active chapter. Last completed: ch{latest}.")
@@ -371,6 +439,12 @@ class Session:
 
 
 def main() -> None:
+    # The LLM client logs a cache-threshold warning when a system prompt is
+    # below Opus 4.7's 4096-token minimum. Useful for development, ugly
+    # mid-conversation. Suppress by default; set TC_DEBUG=1 to see it.
+    llm_log_level = logging.DEBUG if os.environ.get("TC_DEBUG") else logging.ERROR
+    logging.getLogger("textbook_companion.llm").setLevel(llm_log_level)
+
     data_root = DEFAULT_DATA_ROOT
     book_id = BOOK_ID
     state_path = storage.session_state_path(data_root, book_id)

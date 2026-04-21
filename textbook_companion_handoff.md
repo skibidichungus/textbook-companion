@@ -95,7 +95,7 @@ class LogEntry(BaseModel):
     timestamp: str
     book_id: str
     chapter_num: int
-    entry_type: Literal["reaction", "quiz_answer", "struggle_flag", "problem_attempt", "question", "note"]
+    entry_type: Literal["reflection", "quiz_answer", "struggle_flag", "problem_attempt", "question", "note"]
     content: str
     metadata: dict
 ```
@@ -174,7 +174,7 @@ CLI reads from a `>` prompt, routes by simple prefix match. Commands:
 - `done ch<N>` — end-of-chapter flow:
   1. Show recap (LLM-generated from the cached ChapterSummary, using `chapter_recap.txt` content)
   2. Ask 2–3 quiz questions (LLM-generated via `end_of_chapter_quiz.txt`); log each answer as a `LogEntry`
-  3. Prompt for free-form reactions; log as `reaction`
+  3. Prompt for free-form reflections; log as `reflection`
   4. Ask which `end_of_chapter_problems` were attempted; log each as `problem_attempt`
   5. Mark chapter completed with current timestamp
 - `what was ch<N> about` — print `one_line` + `overview`
@@ -206,6 +206,42 @@ Added after the original M4 ship so the companion is more than a command dispatc
 - `note <text>` — logs a `note` entry attached to the active chapter. No LLM call. Requires an active chapter.
 
 Extend `EntryType` with `"question"` and `"note"`. Tests: parser round-trip for both; session tests that verify the log entries are written with the right fields and that both commands refuse cleanly without an active chapter.
+
+Stop and report.
+
+### M4.6 — UX cleanups from first real use
+
+Shook out in the first interactive session. Four fixes:
+
+1. **Silence the cache-threshold warning in `session.main()`.** The `textbook_companion.llm` logger still emits the warning (tests still verify it), but `main()` sets that logger to ERROR by default. Set `TC_DEBUG=1` in the env to re-enable it.
+2. **Rename the reactions prompt to "reflections".** The word "reactions" confused the user mid-flow. Prompt now reads *"Any reflections on this chapter? (what clicked, what didn't — blank to skip)"*. The `LogEntry.entry_type` was also renamed from `"reaction"` to `"reflection"` in M4.7 to keep UI and schema in sync.
+3. **Add `attempting <label>` command.** Logs a `problem_attempt` entry the moment you actually sit down and work a problem, rather than batching at `done`. Requires an active chapter.
+4. **Drop the end-of-chapter "which problems did you attempt" batch question.** `attempting` replaces it. The done-flow is now: recap → quiz → reflections → mark complete.
+5. **Smart `starting chN` behaviour.** Covers the full case table:
+   - `current == N`: no-op with "Already reading chN.", skip deps/refresher.
+   - `current == M (≠ N)` and M is **not** in `chapters_completed`: confirm prompt *"You're currently reading chM (not marked complete). Switch to chN anyway? [y/N]"*. Declining keeps you on M; accepting switches to N and leaves M uncompleted so you can come back.
+   - `current == M (≠ N)` and M **is** completed: switch cleanly, no confirm.
+   - Revisiting a chapter already in `chapters_completed`: switch with a soft note *"Revisiting chN (already completed)."*.
+
+Tests cover every branch of the starting case table, the attempting command (parser + session), the removed batch problems prompt, and the new reflections wording.
+
+Stop and report.
+
+### M4.7 — Proper reflection rename and in-progress chapter tracking
+
+Two changes:
+
+1. **Schema rename: `EntryType` value `"reaction"` → `"reflection"`.** Done properly this time (M4.6 only updated the UI). `LogEntry.entry_type` now validates against the new literal and rejects the old string with a Pydantic error. If any local `reading_log.jsonl` has legacy `"reaction"` entries they'll fail to load — regenerate fixtures (`python -m textbook_companion.fixtures`) to reset the log, or hand-edit the file. No runtime migration is provided; this is a personal tool with disposable data.
+2. **New `SessionState.chapters_in_progress: dict[int, str]`** (chapter_num → ISO timestamp of first start). Orthogonal to `current_chapter`, which is just the focus pointer — a chapter is "in progress" until you run `done chN` on it. Abandoning (switching to another chapter without `done`) leaves the prior chapter in `chapters_in_progress` so the signal isn't lost.
+
+Behavior changes:
+
+- `cmd_starting(n)` adds N to `chapters_in_progress` on first real start. Revisiting a completed chapter does **not** re-open it (you're already done). If multiple chapters are now in progress, the starting message lists the others: *"(Also in progress: ch3)"*.
+- `cmd_done(n)` pops N from `chapters_in_progress` and adds to `chapters_completed`.
+- `status` shows an **"In progress:"** section listing each tracked chapter with its start timestamp.
+- Greeting mentions other in-progress chapters after the main "you left off in chN" line.
+
+Tests: model round-trip for the new field; session tests for marking in-progress on start, removing on done, preserving across abandonment, not re-opening on revisit; status and greeting output.
 
 Stop and report.
 

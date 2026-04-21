@@ -64,6 +64,7 @@ def test_session_state_round_trip() -> None:
     s = SessionState(
         book_id="gaddis_python_6e",
         current_chapter=5,
+        chapters_in_progress={5: "2026-04-15T10:00:00Z"},
         chapters_completed={1: "2026-04-10T10:00:00Z", 2: "2026-04-11T10:00:00Z"},
         struggle_flags={"recursion": [12]},
         last_active="2026-04-18T10:00:00Z",
@@ -71,11 +72,13 @@ def test_session_state_round_trip() -> None:
     round = SessionState.model_validate_json(s.model_dump_json())
     assert round == s
     assert round.chapters_completed[1] == "2026-04-10T10:00:00Z"
+    assert round.chapters_in_progress[5] == "2026-04-15T10:00:00Z"
 
 
 def test_session_state_defaults() -> None:
     s = SessionState(book_id="b", last_active="2026-04-18T00:00:00Z")
     assert s.current_chapter is None
+    assert s.chapters_in_progress == {}
     assert s.chapters_completed == {}
     assert s.struggle_flags == {}
 
@@ -85,11 +88,25 @@ def test_log_entry_round_trip() -> None:
         timestamp="2026-04-18T10:00:00Z",
         book_id="gaddis_python_6e",
         chapter_num=5,
-        entry_type="reaction",
+        entry_type="reflection",
         content="The functions chapter clicked.",
         metadata={"mood": "good"},
     )
     assert LogEntry.model_validate_json(e.model_dump_json()) == e
+
+
+def test_log_entry_rejects_legacy_reaction_type() -> None:
+    # `reaction` was renamed to `reflection` in M4.7 — verify the old value
+    # no longer validates so stale data doesn't silently slip in.
+    with pytest.raises(ValidationError):
+        LogEntry(
+            timestamp="x",
+            book_id="b",
+            chapter_num=1,
+            entry_type="reaction",  # type: ignore[arg-type]
+            content="c",
+            metadata={},
+        )
 
 
 def test_log_entry_rejects_invalid_type() -> None:
