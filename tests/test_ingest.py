@@ -335,13 +335,14 @@ def test_split_by_toc_returns_none_when_too_few_chapters() -> None:
     pages = _make_section_pages(2)
     toc: list[TocEntry] = _make_toc_entries(2)
     result = _split_by_toc(pages, toc)
-    assert result is None
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2]
 
 
 def test_split_by_toc_ignores_non_level1_entries() -> None:
     """Level-2 (sub-section) TOC entries should not be treated as chapters."""
     pages = _make_section_pages(4)
-    # Mix level-1 and level-2 entries; only 2 level-1 chapter entries → below threshold
+    # Mix level-1 and level-2 entries; only the 2 level-1 entries should count.
     toc: list[TocEntry] = [
         (1, "Chapter 1: Intro", 1),
         (2, "1.1 Sub-section", 1),
@@ -349,8 +350,8 @@ def test_split_by_toc_ignores_non_level1_entries() -> None:
         (2, "2.1 Sub-section", 2),
     ]
     result = _split_by_toc(pages, toc)
-    # Only 2 level-1 chapter entries → below _MIN_CHAPTERS_REQUIRED (3)
-    assert result is None
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2]
 
 
 def test_split_by_toc_detects_misspelled_chapter_keyword() -> None:
@@ -389,6 +390,83 @@ def test_split_by_toc_detects_foreign_keyword() -> None:
     assert 5 in nums
 
 
+def test_split_by_toc_prefers_deeper_explicit_chapter_level() -> None:
+    pages = _make_section_pages(4)
+    toc: list[TocEntry] = [
+        (1, "Cover", 1),
+        (1, "PART ONE OVERVIEW", 1),
+        (1, "PART TWO DETAILS", 3),
+        (2, "Chapter 1 Introduction", 1),
+        (2, "Chapter 2 Basics", 2),
+        (2, "Chapter 3 Advanced Topics", 3),
+        (2, "Chapter 4 Wrap-Up", 4),
+        (3, "1.1 First Section", 1),
+        (3, "2.1 Second Section", 2),
+    ]
+
+    result = _split_by_toc(pages, toc)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3, 4]
+    assert [r[1] for r in result] == [
+        "Chapter 1 Introduction",
+        "Chapter 2 Basics",
+        "Chapter 3 Advanced Topics",
+        "Chapter 4 Wrap-Up",
+    ]
+
+
+def test_split_by_toc_merges_best_titles_across_levels() -> None:
+    pages = _make_section_pages(3)
+    toc: list[TocEntry] = [
+        (1, "Chapter 1 Introduction", 1),
+        (1, "PART ONE RELATIONAL LANGUAGES", 2),
+        (2, "1.1 Database-System Applications", 1),
+        (2, "Chapter 2 Introduction to the Relational Model", 2),
+        (2, "Chapter 3 Introduction to SQL", 3),
+    ]
+
+    result = _split_by_toc(pages, toc)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert [r[1] for r in result] == [
+        "Chapter 1 Introduction",
+        "Chapter 2 Introduction to the Relational Model",
+        "Chapter 3 Introduction to SQL",
+    ]
+
+
+def test_split_by_toc_falls_back_to_unnumbered_chapter_titles() -> None:
+    body = "Body text for this section. " * 30
+    pages = [
+        f"Language Basics\n\n{body}",
+        f"Types\n\n{body}",
+        f"Literals\n\n{body}",
+    ]
+    toc: list[TocEntry] = [
+        (1, "Table of Contents", 1),
+        (1, "Preface", 1),
+        (1, "I", 1),
+        (1, "Language Basics", 1),
+        (1, "Types", 2),
+        (1, "Literals", 3),
+        (1, "Index", 3),
+        (2, "Characteristics of C", 1),
+        (2, "Object Types", 2),
+    ]
+
+    result = _split_by_toc(pages, toc)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert [r[1] for r in result] == [
+        "Language Basics",
+        "Types",
+        "Literals",
+    ]
+
+
 def test_split_chapters_uses_toc_over_regex(tmp_path: Path) -> None:
     """With a valid TOC, split_chapters should use Layer 1 (TOC)."""
     body = "Body text for this section. " * 30
@@ -408,6 +486,24 @@ def test_split_chapters_uses_toc_over_regex(tmp_path: Path) -> None:
     result = split_chapters(pages, toc=toc)
     assert [r[0] for r in result] == [1, 2, 3, 4]
     # Body text from respective pages should appear in each chapter.
+    assert "Introduction content" in result[0][2]
+    assert "Variables content" in result[1][2]
+
+
+def test_split_chapters_accepts_two_chapter_toc_book() -> None:
+    body = "Body text for this section. " * 30
+    pages = [
+        f"Introduction content\n\n{body}",
+        f"Variables content\n\n{body}",
+    ]
+    toc: list[TocEntry] = [
+        (1, "Chapter 1: Introduction", 1),
+        (1, "Chapter 2: Variables", 2),
+    ]
+
+    result = split_chapters(pages, toc=toc)
+
+    assert [r[0] for r in result] == [1, 2]
     assert "Introduction content" in result[0][2]
     assert "Variables content" in result[1][2]
 
@@ -454,14 +550,15 @@ def test_split_by_section_numbering_detects_gaddis_pattern() -> None:
     assert nums == [1, 2, 3, 4]
 
 
-def test_split_by_section_numbering_returns_none_when_too_few() -> None:
-    """_split_by_section_numbering returns None if fewer than _MIN_CHAPTERS_REQUIRED."""
+def test_split_by_section_numbering_accepts_two_chapters() -> None:
+    """_split_by_section_numbering should handle valid two-chapter books."""
     pages = [
         _make_section_page(1, "Why Program?"),
         _make_section_page(2, "The Parts"),
     ]
     result = _split_by_section_numbering(pages)
-    assert result is None
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2]
 
 
 def test_split_by_section_numbering_body_contains_content() -> None:
@@ -494,6 +591,32 @@ def test_split_by_section_numbering_does_not_double_count_on_same_page() -> None
     assert nums.count(1) == 1
 
 
+def test_split_by_section_numbering_ignores_toc_like_front_matter() -> None:
+    toc_page = "\n".join(
+        [
+            "Contents",
+            "1.1 Intro",
+            "2.1 Variables",
+            "3.1 Control Flow",
+            "More front matter text.",
+        ]
+    )
+    pages = [
+        toc_page,
+        _make_section_page(1, "Intro", body="REAL_CH1 " * 40),
+        _make_section_page(2, "Variables", body="REAL_CH2 " * 40),
+        _make_section_page(3, "Control Flow", body="REAL_CH3 " * 40),
+    ]
+
+    result = _split_by_section_numbering(pages)
+
+    assert result is not None
+    assert [r[0] for r in result] == [1, 2, 3]
+    assert "1.1  Intro" in result[0][2]
+    assert "REAL_CH1" in result[0][2]
+    assert "Contents" not in result[0][2]
+
+
 def test_split_chapters_uses_section_numbering_when_no_toc_and_no_keywords() -> None:
     """With no TOC and no 'Chapter N' keywords, Layer 2 should activate."""
     pages = [
@@ -520,6 +643,19 @@ def test_split_chapters_section_numbering_text_includes_body() -> None:
     assert "WHY_PROGRAM_BODY" in result[0][2]
     assert "DATA_TYPES_BODY" in result[1][2]
     assert "CONTROL_FLOW_BODY" in result[2][2]
+
+
+def test_split_chapters_accepts_two_chapter_section_numbered_book() -> None:
+    pages = [
+        _make_section_page(1, "Why Program?", body="CH1_BODY " * 40),
+        _make_section_page(2, "Data Types", body="CH2_BODY " * 40),
+    ]
+
+    result = split_chapters(pages, toc=None)
+
+    assert [r[0] for r in result] == [1, 2]
+    assert "CH1_BODY" in result[0][2]
+    assert "CH2_BODY" in result[1][2]
 
 
 # ---------------------------------------------------------------------------

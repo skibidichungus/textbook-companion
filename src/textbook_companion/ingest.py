@@ -39,9 +39,10 @@ _SCAN_THRESHOLD_CHARS_PER_PAGE = 50
 # to mention many chapter headings before the real chapter 1 begins.
 _FRONT_MATTER_MAX_PAGE = 15
 
-# Minimum number of chapters we require before accepting a detection strategy.
-# If a strategy finds fewer than this, we fall through to the next layer.
-_MIN_CHAPTERS_REQUIRED = 3
+# Minimum number of chapters required before a detection strategy is considered
+# credible. Two-chapter books are valid, but a single detected chapter is too
+# weak a signal for the TOC/section-numbering strategies to win.
+_MIN_CHAPTERS_REQUIRED = 2
 
 
 def extract_text(pdf_path: Path) -> list[str]:
@@ -185,13 +186,26 @@ _SECTION_ONE_RE = re.compile(
 )
 
 # TOC title patterns that look like chapter entries (contain a chapter number
-# or the words Chapter/Part).
+# or chapter-start section markers.
 _TOC_CHAPTER_RE = re.compile(
-    r"(?:chapter|part)\s+(\d+|[IVXLCDM]+)"  # group 1: keyword + number
-    r"|^(\d+)\s+\S"                           # group 2: bare leading number
-    r"|\b(\d{1,3})\b",                        # group 3: any standalone number (typos/foreign)
+    r"(?:chapter|ch\.?)\s+(\d+|[IVXLCDM]+)\b",  # explicit chapter keyword
     re.IGNORECASE,
 )
+_TOC_SECTION_START_RE = re.compile(r"^\s*(\d+)\.1(?:\s|$)")
+_TOC_GENERIC_NUMBER_RE = re.compile(r"\b(\d{1,3})\b")
+_TOC_ROMAN_TITLE_RE = re.compile(r"^\s*[IVXLCDM]+\s*$", re.IGNORECASE)
+_TOC_FRONT_MATTER_TITLES = {
+    "cover",
+    "title page",
+    "copyright",
+    "contents",
+    "table of contents",
+    "preface",
+    "credits",
+    "index",
+    "glossary",
+    "eula",
+}
 
 
 def _parse_chapter_num(token: str) -> int:
@@ -234,6 +248,61 @@ def _match_chapter_heading(line: str) -> tuple[int, str] | None:
     return None
 
 
+def _normalise_toc_title(title: str) -> str:
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _is_nonchapter_toc_title(title: str) -> bool:
+    norm = _normalise_toc_title(title).lower()
+    if not norm:
+        return True
+    if norm in _TOC_FRONT_MATTER_TITLES:
+        return True
+    if norm.startswith("part "):
+        return True
+    if norm.startswith("appendix"):
+        return True
+    return bool(_TOC_ROMAN_TITLE_RE.fullmatch(norm))
+
+
+def _toc_title_candidates(
+    title: str,
+) -> list[tuple[int, int, str]]:
+    """Return candidate chapter matches from a TOC title.
+
+    Each candidate is ``(priority, chapter_num, cleaned_title)`` where higher
+    priority is better:
+    3 = explicit ``Chapter N ...`` title
+    2 = section-start title like ``2.1 ...``
+    1 = generic numeric fallback for typos / foreign-language titles
+    """
+    cleaned = _normalise_toc_title(title)
+    candidates: list[tuple[int, int, str]] = []
+
+    m = _TOC_CHAPTER_RE.search(cleaned)
+    if m:
+        num = _parse_chapter_num(m.group(1))
+        if num > 0:
+            candidates.append((3, num, cleaned))
+
+    m = _TOC_SECTION_START_RE.match(cleaned)
+    if m:
+        num = int(m.group(1))
+        if num > 0:
+            candidates.append((2, num, cleaned))
+
+    # Last resort: salvage a chapter number from titles like "Chpater 3: ..."
+    # or foreign-language entries that still contain a single chapter number.
+    if not candidates and not _is_nonchapter_toc_title(cleaned):
+        m = _TOC_GENERIC_NUMBER_RE.search(cleaned)
+        if m:
+            num = int(m.group(1))
+            if num > 0:
+                candidates.append((1, num, cleaned))
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Layer 1 — PDF TOC bookmarks
 # ---------------------------------------------------------------------------
@@ -255,36 +324,53 @@ def _split_by_toc(
     if not toc:
         return None
 
-    # Filter to level-1 entries that look like chapters.
-    chapter_entries: list[tuple[int, str, int]] = []  # (chapter_num, title, page_0idx)
+    by_level: dict[int, list[tuple[str, int]]] = {}
     for level, title, pg_1idx in toc:
-        if level != 1:
-            continue
-        m = _TOC_CHAPTER_RE.search(title)
-        if not m:
-            continue
-        # Extract chapter number from whichever group matched.
-        num_token = m.group(1) or m.group(2) or m.group(3) or ""
-        num = _parse_chapter_num(num_token)
-        if num <= 0:
-            continue
-        page_0idx = max(0, pg_1idx - 1)
-        chapter_entries.append((num, title.strip(), page_0idx))
+        by_level.setdefault(level, []).append((title, max(0, pg_1idx - 1)))
+
+    chapter_entries: list[tuple[int, str, int]] = []
+
+    # Pass 1: keep the strongest numbered candidate for each chapter across
+    # all TOC levels. This lets us combine a shallow "Chapter 1 ..." bookmark
+    # with deeper "Chapter 2 ...", "Chapter 3 ..." entries when publishers mix
+    # TOC depth by chapter.
+    best_by_num: dict[int, tuple[int, str, int]] = {}
+    for level in sorted(by_level):
+        for raw_title, page_0idx in by_level[level]:
+            for priority, num, cleaned in _toc_title_candidates(raw_title):
+                current = best_by_num.get(num)
+                if current is None or priority > current[0] or (
+                    priority == current[0] and page_0idx < current[2]
+                ):
+                    best_by_num[num] = (priority, cleaned, page_0idx)
+
+    if len(best_by_num) >= _MIN_CHAPTERS_REQUIRED:
+        chapter_entries = sorted(
+            [
+                (num, title, pg)
+                for num, (priority, title, pg) in best_by_num.items()
+            ],
+            key=lambda e: e[2],
+        )
+    else:
+        # Pass 2: fall back to the shallowest TOC level with plausible
+        # chapter titles, assigning chapter numbers sequentially.
+        for level in sorted(by_level):
+            filtered = [
+                (_normalise_toc_title(title), page_0idx)
+                for title, page_0idx in by_level[level]
+                if not _is_nonchapter_toc_title(title)
+            ]
+            if len(filtered) < _MIN_CHAPTERS_REQUIRED:
+                continue
+            chapter_entries = [
+                (idx, title, page_0idx)
+                for idx, (title, page_0idx) in enumerate(filtered, 1)
+            ]
+            break
 
     if len(chapter_entries) < _MIN_CHAPTERS_REQUIRED:
         return None
-
-    # Sort by page order (not chapter number) in case the TOC is reordered.
-    chapter_entries.sort(key=lambda e: e[2])
-
-    # Remove duplicates by chapter number (keep first occurrence).
-    seen: set[int] = set()
-    unique: list[tuple[int, str, int]] = []
-    for num, title, pg in chapter_entries:
-        if num not in seen:
-            seen.add(num)
-            unique.append((num, title, pg))
-    chapter_entries = unique
 
     # Build flat text and page-start offsets.
     page_starts, flat = _build_flat(pages)
@@ -324,25 +410,61 @@ def _split_by_section_numbering(
     ``_MIN_CHAPTERS_REQUIRED`` distinct chapter numbers are found, otherwise
     returns ``None``.
     """
-    # Walk every page; collect (chapter_num, page_0idx) for each N.1 restart.
-    boundaries: list[tuple[int, int]] = []  # (chapter_num, page_0idx)
-    seen_chapters: set[int] = set()
+    # Walk every page; collect all N.1 matches so we can detect TOC-like pages,
+    # plus the first N.1 per page as the actual chapter-start candidate.
+    candidates: list[tuple[int, int]] = []  # (chapter_num, page_0idx)
+    page_section_nums: dict[int, set[int]] = {}
 
     for page_idx, page_text in enumerate(pages):
+        first_match: int | None = None
+        nums_on_page: set[int] = set()
         for line in page_text.splitlines():
             m = _SECTION_ONE_RE.match(line)
             if m:
                 chapter_num = int(m.group(1))
-                if chapter_num > 0 and chapter_num not in seen_chapters:
-                    seen_chapters.add(chapter_num)
-                    boundaries.append((chapter_num, page_idx))
-                break  # only consider the first N.1 per page
+                if chapter_num > 0:
+                    nums_on_page.add(chapter_num)
+                    if first_match is None:
+                        first_match = chapter_num
+        if nums_on_page:
+            page_section_nums[page_idx] = nums_on_page
+        if first_match is not None:
+            candidates.append((first_match, page_idx))
 
-    if len(boundaries) < _MIN_CHAPTERS_REQUIRED:
+    if len({chapter_num for chapter_num, _ in candidates}) < _MIN_CHAPTERS_REQUIRED:
         return None
+
+    # A front-matter contents page often lists several N.1 section restarts
+    # before the real chapter 1 begins. Treat any early page with multiple
+    # distinct chapter numbers as TOC-like and ignore it for boundary picking.
+    toc_like_pages = {
+        page_idx
+        for page_idx in range(min(len(pages), _FRONT_MATTER_MAX_PAGE + 1))
+        if len(page_section_nums.get(page_idx, set())) >= 2
+    }
+    filtered = [candidate for candidate in candidates if candidate[1] not in toc_like_pages]
+    if not filtered:
+        filtered = candidates
+
+    boundaries: list[tuple[int, int]] = []
+    seen_chapters: set[int] = set()
+    max_seen = 0
+    for chapter_num, page_idx in filtered:
+        if page_idx <= _FRONT_MATTER_MAX_PAGE and chapter_num < max_seen:
+            boundaries.clear()
+            seen_chapters.clear()
+            max_seen = 0
+        if chapter_num not in seen_chapters:
+            seen_chapters.add(chapter_num)
+            boundaries.append((chapter_num, page_idx))
+        if chapter_num > max_seen:
+            max_seen = chapter_num
 
     # Sort by page order.
     boundaries.sort(key=lambda b: b[1])
+
+    if len(boundaries) < _MIN_CHAPTERS_REQUIRED:
+        return None
 
     page_starts, flat = _build_flat(pages)
 
