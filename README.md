@@ -1,15 +1,8 @@
 # Textbook Companion
 
-A personal CLI reading companion for coding textbooks. You read chapters in a
-PDF viewer or on paper; this tool helps you recall, connect, and retain what
-you read across chapters — and lets you ask grounded questions or jot notes as
-you go.
-
-**This is Phase 1.** The book content is hand-authored fixture data for
-*Starting Out with Python* (Gaddis, 6e). Real PDF ingestion is Phase 2. The
-tool is not a general Q&A chatbot — every question is answered in the context
-of your active chapter, every note is attached to a chapter, and every quiz
-answer is evaluated against that chapter's material.
+A personal CLI reading companion for coding textbooks. Point it at any
+textbook PDF, and it extracts chapters, generates summaries, then lets you
+ask grounded questions, jot notes, and track your progress as you read.
 
 ## Requirements
 
@@ -25,24 +18,43 @@ From the repo root:
 uv sync --all-extras
 ```
 
-This creates `.venv/` and installs `pydantic`, `anthropic`, `pytest`, and
-`mypy`.
+This creates `.venv/` and installs `pydantic`, `anthropic`, `pymupdf`,
+`pytest`, and `mypy`.
 
-## First-time setup
+## Ingest a textbook
 
-1. Generate the fixture book data (writes to `./data/gaddis_python_6e/`):
+Before using the companion, ingest a PDF to extract chapters and generate
+metadata:
 
-   ```
-   uv run python -m textbook_companion.fixtures
-   ```
+```
+uv run python -m textbook_companion.ingest path/to/textbook.pdf
+```
 
-2. Set your API key. Easiest way is to add it to your shell profile so you
-   don't paste it into terminals where it might leak:
+This creates a `data/<book_id>/` directory with chapter text files, LLM
+summaries, and session state. The book ID is derived from the PDF filename.
 
-   ```
-   echo 'export ANTHROPIC_API_KEY=sk-ant-your-key' >> ~/.zshrc
-   source ~/.zshrc
-   ```
+Chapter detection uses a layered strategy:
+
+1. **PDF TOC bookmarks** — reads the PDF's embedded table of contents. Most
+   reliable; works even when chapter headers are graphical/decorative.
+2. **Section-numbering heuristic** — detects N.1 restarts (e.g. "1.1",
+   "2.1"). Catches textbooks with decorative chapter headers but standard
+   section numbers.
+3. **Keyword regex** — matches "Chapter N" / "Part N" in extracted text.
+   Fallback for simpler PDFs.
+
+If multiple books are ingested, the companion auto-detects them at startup
+and lets you pick which one to study.
+
+## Set your API key
+
+Add it to your shell profile so you don't paste it into terminals where it
+might leak:
+
+```
+echo 'export ANTHROPIC_API_KEY=sk-ant-your-key' >> ~/.zshrc
+source ~/.zshrc
+```
 
 ## Run
 
@@ -56,20 +68,13 @@ state-changing command, so restarting always picks up where you stopped.
 
 ## Commands
 
-Everything the companion understands:
-
 | Command | LLM? | What it does |
 |---|:---:|---|
 | `starting ch<N>` | no | Set chapter N as active. Confirms before abandoning an incomplete chapter; prints a refresher for prerequisites completed >3 days ago. |
-| `done ch<N>` | yes | End-of-chapter flow: Claude writes a recap, asks 2–3 quiz questions, gives tutor-style feedback on each answer, then asks for reflections. Marks the chapter complete. |
-| `ask <question>` | yes | Send a question to Claude grounded in your active chapter. Answer printed immediately; logged to the reading log. |
+| `done ch<N>` | no | Mark chapter N as complete with a timestamp. |
+| `ask <question>` | yes | Send a question grounded in your active chapter's full text. Answer printed immediately; logged to the reading log. |
 | `note <text>` | no | Log a free-form note attached to the active chapter. |
-| `attempting <label>` | no | Log a problem attempt. Detects when the label belongs to a different chapter (e.g. `1.1` while reading ch2) and asks whether to reroute. |
-| `struggling with <term>` | no | Flag a concept you're stuck on; attaches to the current chapter. |
-| `what was ch<N> about` | no | Print the chapter's one-liner + overview. |
-| `recap ch<N>` | no | Print the chapter's overview, key concepts, and worked-example labels. |
-| `concept <term>` | no | Look up a term in the concept graph: definition, where it was introduced, where it gets reused. |
-| `status` | no | Current chapter, in-progress chapters with timestamps, completed chapters, active struggle flags. |
+| `status` | no | Current chapter, in-progress chapters, completed chapters. |
 | `quit` / `exit` | no | Leave. |
 
 Commands are matched by prefix; chapter numbers can be `ch5` or `ch05`,
@@ -78,47 +83,46 @@ returns to the prompt.
 
 ## What persists
 
-Everything lives under `data/gaddis_python_6e/`:
+Everything lives under `data/<book_id>/`:
 
 ```
-book_overview.json       immutable book metadata (from fixtures)
-chapters/ch01.json …     one file per chapter (from fixtures)
-concept_graph.json       cross-chapter concept reuse (from fixtures)
+book_overview.json       book metadata (generated during ingestion)
+chapters/ch01.json …     per-chapter LLM summary
+chapters/ch01.txt …      per-chapter raw extracted text (source of truth)
 session_state.json       your current chapter, in-progress set,
-                         completed set, struggle flags — atomic writes
-reading_log.jsonl        append-only log of every quiz answer,
-                         reflection, question, note, problem attempt,
-                         struggle flag
+                         completed set — atomic writes
+reading_log.jsonl        append-only log of every question, answer, and note
 ```
 
-The fixture files (first three) can be regenerated at any time with
-`python -m textbook_companion.fixtures`. Your state + log are yours — don't
-let the fixtures command overwrite them if you want to keep history.
+You can re-ingest a PDF at any time to regenerate the metadata. Your
+session state and reading log are separate and won't be overwritten.
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | *(required)* | Auth for the Anthropic SDK. |
-| `TC_DEBUG` | *(unset)* | Set to any value to re-enable the LLM cache-threshold warning on stderr. Silenced by default to keep the interactive loop clean. |
+| `TC_DEBUG` | *(unset)* | Set to any value to re-enable the LLM cache-threshold warning on stderr. |
 
 ## Testing
 
 ```
-uv run pytest                # 101 tests, offline
-uv run pytest -m live        # 2 smoke tests that hit the real API
+uv run pytest                # 140 tests, offline
+uv run pytest -m live        # 3 smoke tests that hit the real API
 ```
 
 The live tests require `ANTHROPIC_API_KEY` to be set; they skip silently
-otherwise. See [WALKTHROUGH.md](WALKTHROUGH.md) for a realistic session.
+otherwise.
 
 ## Project layout
 
 ```
 src/textbook_companion/
 ├── __init__.py
+├── __main__.py      package entry point
 ├── commands.py      pure CLI parser → frozen dataclasses
-├── fixtures.py      hand-authored Gaddis fixtures + data writer
+├── fixtures.py      hand-authored Gaddis fixtures (Phase 1 legacy)
+├── ingest.py        PDF extraction, chapter splitting, LLM metadata gen
 ├── llm.py           LLMClient protocol + ClaudeClient (only import site
 │                    for `anthropic`)
 ├── models.py        Pydantic data models
@@ -126,9 +130,8 @@ src/textbook_companion/
 ├── storage.py       atomic JSON writes + JSONL append helpers
 └── prompts/
     ├── session_system.txt
-    ├── chapter_recap.txt
-    ├── end_of_chapter_quiz.txt
-    └── quiz_feedback.txt
+    ├── ingest_book_overview.txt
+    └── ingest_chapter_summary.txt
 ```
 
 Swapping the LLM backend (e.g. a local Ollama model) is a matter of writing
@@ -136,5 +139,8 @@ a second class implementing `LLMClient`.
 
 ## Status
 
-Phase 1 is feature-complete. See `textbook_companion_handoff.md` for the
-original spec and milestone-by-milestone history (M1 through M4.9 + M5).
+Phase 2 is feature-complete. The tool ingests any textbook PDF, extracts
+chapters via a layered detection strategy (TOC bookmarks → section numbering
+→ regex), generates per-chapter summaries, and provides a grounded reading
+companion. Tested across 7 textbooks covering C++, Python, C, operating
+systems, databases, software testing, and statistics.
